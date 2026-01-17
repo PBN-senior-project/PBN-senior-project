@@ -1,0 +1,10 @@
+,precision,recall,f1-score,support
+Atelectasis,0.0,0.0,0.0,218.0
+Cardiomegaly,0.0,0.0,0.0,156.0
+Edema,0.0,0.0,0.0,154.0
+Emphysema,0.0,0.0,0.0,155.0
+Fibrosis,0.0,0.0,0.0,150.0
+micro avg,0.0,0.0,0.0,833.0
+macro avg,0.0,0.0,0.0,833.0
+weighted avg,0.0,0.0,0.0,833.0
+samples avg,0.0,0.0,0.0,833.0
