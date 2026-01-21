@@ -1,0 +1,32 @@
+# Python / Virtual Env
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Dataset (ห้ามขึ้น GitHub)
+data/
+datasets/
+nih-dataset/
+
+# Experiment outputs
+outputs/
+outputs_5class/
+outputs_binary/
+outputs_binary_v2/
+
+# Models / checkpoints
+*.h5
+*.ckpt
+*.pt
+*.pth
+
+# Logs / OS
+*.log
+Thumbs.db
+.DS_Store
