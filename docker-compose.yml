@@ -1,0 +1,19 @@
+services:
+  chestxray:
+    build: .
+    container_name: pbn-chestxray-v7
+
+    volumes:
+      - ./src:/app/src
+      - ./archive:/app/archive
+      - ./outputs:/app/outputs
+      - ./models_v7:/app/models_v7
+
+    command: python src/train_V7.py
+
+    networks:
+      - chestxray-network
+
+networks:
+  chestxray-network:
+    name: pbn-chestxray-network

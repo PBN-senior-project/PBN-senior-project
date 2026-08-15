@@ -1,0 +1,32 @@
+run:
+  name: "baseline_run"
+  seed: 42
+  out_dir: "../runs"
+
+data:
+  csv_path: "archive/Data_Entry_2017.csv"
+  img_root: "archive"
+  train_list: "archive/train_80_oversampled.txt"
+  test_list: "archive/test_20_fixed.txt"
+  img_size: 224
+  batch_size: 16
+
+labels:
+  classes: ["Atelectasis","Cardiomegaly","Edema","Emphysema","Fibrosis"]
+
+model:
+  backbone: "densenet121"
+  pretrained: true
+  dropout: 0.3
+  last_conv_layer: ""
+
+train:
+  epochs: 10 
+  lr: 0.0001
+  optimizer: "adam"
+  early_stop_patience: 3
+  reduce_lr_patience: 2
+  reduce_lr_factor: 0.5
+
+loss:
+  type: "weighted_bce"

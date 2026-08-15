@@ -1,0 +1,10 @@
+archive/
+nih_AP_chest/
+padchest_AP_chest/
+runs/
+venv/
+.venv/
+.git/
+__pycache__/
+*.keras
+*.h5
