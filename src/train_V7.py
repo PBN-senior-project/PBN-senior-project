@@ -73,7 +73,7 @@ print(f"   📈 Train data size increased from {len(df)*0.8:.0f} to {len(train_d
 # ---------------------------------------------------------
 # 2️⃣ SOTA Algorithm: Weighted Focal Loss
 # ---------------------------------------------------------
-pos_counts = train_df[CLASSES].sum().values
+pos_counts = train_df[CLASSES].sum().values 
 total = len(train_df)
 # คำนวณ Weights จาก Dataset ที่ปรับสมดุลแล้ว
 weight_values = (total / (pos_counts + 1e-5)) / 2.0 
@@ -97,23 +97,120 @@ def weighted_focal_loss(pos_weights, gamma=2.0):
 # ---------------------------------------------------------
 # ⭐ [V7 UPDATE] 3️⃣ Generators & Medical Augmentation
 # ---------------------------------------------------------
+import cv2  # ⭐ [V7 UPDATE - เพิ่มใหม่] ใช้สำหรับทำ CLAHE (Adaptive Windowing)
+
+# ==========================================================
+# ⭐ [V7 UPDATE - เพิ่มใหม่ทั้งฟังก์ชัน] Custom Preprocessing
+# รวม 3 เทคนิค: CLAHE + Gamma Correction + Gaussian Noise
+# ทำงานหลัง rescale (ภาพเป็น float32 ช่วง 0-1) จึงต้อง denormalize
+# ก่อนใช้ OpenCV แล้วค่อย normalize กลับ
+# ==========================================================
+def medical_preprocessing(img):
+    # ----- แปลงกลับเป็น uint8 (0-255) เพื่อใช้กับ OpenCV -----
+    img_uint8 = (img * 255).astype(np.uint8)
+
+    # ⭐ เทคนิคที่ 1: CLAHE (Adaptive Windowing)
+    # ผลที่ได้: ดึง contrast ในเนื้อปอด (บริเวณมืด) ให้เห็นรอยโรคชัดขึ้น
+    # ทำไมต้องมี: ภาพ X-ray จาก dataset NIH มาจากหลายเครื่อง/หลาย
+    # โรงพยาบาล contrast ไม่เท่ากัน CLAHE ช่วยให้ทุกภาพมี contrast
+    # ที่สม่ำเสมอมากขึ้น -> โมเดล generalize ข้ามเครื่อง/โรงพยาบาลได้ดีขึ้น
+    # ทำแบบ deterministic (ทำทุกภาพเหมือนกัน ไม่สุ่ม)
+    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    img_uint8 = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    # ----- กลับเป็น float32 (0-1) -----
+    img = img_uint8.astype(np.float32) / 255.0
+
+    # ⭐ เทคนิคที่ 2: Gamma Correction (สุ่มค่า 0.85-1.15 ทุกครั้งที่เรียก)
+    # ผลที่ได้: จำลองความสว่าง/ความเข้มของภาพที่ต่างกันไปในแต่ละครั้ง
+    # (คล้าย Brightness แต่ non-linear และควบคุมได้ปลอดภัยกว่า)
+    # ทำไมต้องมี: ทดแทน Brightness ที่ถูกถอดออกไป โดยเปลี่ยนความสว่าง
+    # แบบ "นุ่มนวลกว่า" ไม่ทำให้ค่า pixel หลุดขอบ (clip) ง่ายเท่า brightness ตรงๆ
+    gamma = np.random.uniform(0.85, 1.15)
+    img = np.power(img, gamma)
+
+    # ⭐ เทคนิคที่ 3: Gaussian Noise (สุ่มใส่ 50% ของภาพ, intensity ต่ำมาก)
+    # ผลที่ได้: จำลอง sensor noise หรือ noise จากการบีบอัดไฟล์ภาพ (JPEG)
+    # ทำไมต้องมี: ทำให้โมเดล robust ขึ้น ไม่ overfit กับภาพที่ "สะอาด"เกินไป
+    # ใส่เบามาก (std=0.01) เพราะถ้าใส่แรงจะกลบรอยโรคเล็กๆ อย่าง Nodule ได้
+    if np.random.rand() < 0.5:
+        noise = np.random.normal(0, 0.01, img.shape).astype(np.float32)
+        img = img + noise
+
+    # Clip ให้อยู่ในช่วง 0-1 เสมอ (กันค่าหลุดขอบจาก gamma/noise ด้านบน)
+    img = np.clip(img, 0.0, 1.0)
+    return img
+
+
 # เอา Brightness ออก และลดการขยับลงครึ่งหนึ่งให้พอดีกับสรีระปอด
 train_datagen = ImageDataGenerator(
-    rescale=1./255, 
+    rescale=1./255,
     rotation_range=10,        # ลดจาก 15
     width_shift_range=0.05,   # ลดจาก 0.1
     height_shift_range=0.05,  # ลดจาก 0.1
     zoom_range=0.1,           # ลดจาก 0.15
-    fill_mode='constant', cval=0, 
-    horizontal_flip=True      # คงไว้ตามเปเปอร์ CheXNet (Stanford)
+    shear_range=5,             # ⭐ [V7 UPDATE - เพิ่มใหม่]
+                                # เทคนิค: Shear (บิดภาพตามแนวทแยงเล็กน้อย)
+                                # ผลที่ได้: จำลองมุมถ่ายที่เอียงเล็กน้อยจาก
+                                # ท่ายืน/นั่งของผู้ป่วยตอนถ่ายฟิล์ม ใส่แค่ 5
+                                # องศา (น้อยกว่าค่า default ทั่วไป) เพราะปอด
+                                # มีโครงสร้างตายตัว บิดมากไปจะผิดกายวิภาค
+    fill_mode='constant', cval=0,
+    horizontal_flip=True,      # คงไว้ตามเปเปอร์ CheXNet (Stanford)
+    preprocessing_function=medical_preprocessing
+    # ⭐ [V7 UPDATE - เพิ่มใหม่] เรียกใช้ฟังก์ชันด้านบน
+    # ผลรวม: เพิ่ม CLAHE + Gamma + Gaussian Noise เข้าไปใน pipeline
+    # ของ train_datagen ทำงานหลัง rescale ทุกครั้งที่สุ่มภาพมา train
 )
-val_datagen = ImageDataGenerator(rescale=1./255)
+
+# ⭐ [V7 UPDATE - เพิ่มใหม่ทั้งฟังก์ชัน] Preprocessing สำหรับ validation/TTA
+# ใช้ CLAHE เหมือนกัน (deterministic) แต่ "ไม่" ใส่ gamma/noise แบบสุ่ม
+# เหตุผล: ตอน validate ต้องการผลลัพธ์ที่ reproducible ทุกครั้ง ไม่อยาก
+# ให้ metric แกว่งเพราะ noise สุ่ม แต่ต้องการให้ contrast ของภาพ (CLAHE)
+# สอดคล้องกับที่โมเดลเห็นตอน train เพื่อไม่ให้เกิด distribution mismatch
+def val_preprocessing(img):
+    img_uint8 = (img * 255).astype(np.uint8)
+    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    img_uint8 = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    return img_uint8.astype(np.float32) / 255.0
+
+val_datagen = ImageDataGenerator(
+    rescale=1./255,
+    preprocessing_function=val_preprocessing
+    # ⭐ [V7 UPDATE - เพิ่มใหม่] เดิมมีแค่ rescale=1./255 บรรทัดเดียว
+    # ตอนนี้เพิ่ม CLAHE เข้าไปให้สอดคล้องกับ train_datagen
+)
 
 train_generator = train_datagen.flow_from_dataframe(
     dataframe=train_df, directory=IMG_DIR, x_col='Filename', y_col=CLASSES,
     target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='raw', shuffle=True
 )
 val_generator = val_datagen.flow_from_dataframe(
+    dataframe=val_df, directory=IMG_DIR, x_col='Filename', y_col=CLASSES,
+    target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='raw', shuffle=False
+)
+
+# ==========================================================
+# ⭐ [V7 UPDATE - เพิ่มใหม่ทั้ง block] Test-Time Augmentation (TTA)
+# เทคนิค: TTA (สร้าง generator ที่ 2 ของชุด validation เดิม แต่ flip แนวนอน)
+# ผลที่ได้: ตอน evaluation/ensemble (section 7) จะ predict ภาพ 2 แบบ(ภาพจริง + ภาพ flip) 
+# แล้วเอาผลมาเฉลี่ยกัน ช่วยให้ prediction เสถียรขึ้น มักทำให้ AUC ขยับขึ้นเล็กน้อยโดยไม่ต้อง retrain โมเดลใหม่เลย
+# ใช้เฉพาะตอน inference เท่านั้น ไม่เกี่ยวกับ training loop
+# ==========================================================
+tta_datagen = ImageDataGenerator(
+    rescale=1./255,
+    horizontal_flip=True,
+    preprocessing_function=val_preprocessing
+)
+tta_generator = tta_datagen.flow_from_dataframe(
     dataframe=val_df, directory=IMG_DIR, x_col='Filename', y_col=CLASSES,
     target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='raw', shuffle=False
 )
@@ -184,7 +281,7 @@ for m_name in MODELS_TO_TRAIN:
 # ---------------------------------------------------------
 # 📈 6️⃣ PLOT TRAINING CURVES
 # ---------------------------------------------------------
-print("\n📊 Generating Validation AUC Comparison Graph...")
+print("\n Generating Validation AUC Comparison Graph...")
 plt.figure(figsize=(12, 8))
 for m_name, val_auc_scores in history_dict.items():
     plt.plot(val_auc_scores, label=f'{m_name}', linewidth=2.5, marker='o')
