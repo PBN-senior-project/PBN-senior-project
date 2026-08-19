@@ -6,7 +6,7 @@
 3. ใส่คำสั่งใน command  
 
 ```bash
-git clone https://github.com/theploy67/helloDevops.git
+git clone https://github.com/PBN-senior-project/PBN-senior-project.git
 ````
 
 ---
@@ -35,7 +35,7 @@ git branch
 **Example:**
 
 ```
-  develop
+  dev
   fluke
   grace
 * main   --> เครื่องหมาย * คือ branch ปัจจุบันที่กำลังทำงาน
@@ -104,32 +104,32 @@ git push -u origin ploy
 
 ---
 
-## ✅ Step 2 - เอางานบน branch ตัวเอง push ต่อไปที่ develop
+## ✅ Step 2 - เอางานบน branch ตัวเอง push ต่อไปที่ dev
 
 ❌ พอยดูส่วนนี้คนเดียว
 
 1. กลับมาที่ branch develop
 
 ```bash
-git checkout develop
+git checkout dev
 ```
 
 2. ดึงโค้ดล่าสุดของ develop มาก่อน (กันพัง)
 
 ```bash
-git pull origin develop
+git pull origin dev
 ```
 
 3. รวมงานจาก branch ของเพื่อน (ตัวอย่าง: mint)
 
 ```bash
-git merge --no-ff mint -m "merge: mint → develop"
+git merge --no-ff mint -m "merge: mint → dev"
 ```
 
 4. ดัน develop ขึ้น GitHub
 
 ```bash
-git push origin develop
+git push origin dev
 ```
 
 ตอนนี้โค้ดจากเพื่อนจะถูกรวมเข้าที่ develop แล้ว
@@ -140,13 +140,13 @@ git push origin develop
 
 ❌ พอยดูส่วนนี้คนเดียว
 
-1. ตรวจสอบว่า develop สมบูรณ์แล้ว (เพื่อนทุกคน push งานเข้ามาใน develop เรียบร้อย, ทดสอบระบบแล้ว)
+1. ตรวจสอบว่า deve สมบูรณ์แล้ว (เพื่อนทุกคน push งานเข้ามาใน develop เรียบร้อย, ทดสอบระบบแล้ว)
 
-2. ไปที่ branch develop
+2. ไปที่ branch dev
 
 ```bash
-git checkout develop
-git pull origin develop
+git checkout dev
+git pull origin dev
 ```
 
 3. ไปที่ branch main
