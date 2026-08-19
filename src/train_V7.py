@@ -17,14 +17,15 @@ mixed_precision.set_global_policy('mixed_float16')
 
 CSV_PATH = "/app/archive/Data_Entry_2017.csv"
 
-ARCHIVE_DIR = r"D:\senior-project\ploy-senior-project\archive"
+# ARCHIVE_DIR = r"D:\senior-project\ploy-senior-project\archive"
+ARCHIVE_DIR = "/app/archive"
 
 MODEL_SAVE_DIR = "/app/models_v7"
 GRAPH_SAVE_DIR = "/app/outputs/graphs_v7"
 
 IMG_SIZE = (384, 384)
 BATCH_SIZE = 8
-EPOCHS = 40
+EPOCHS = 10 #40
 INITIAL_LR = 1e-4
 
 CLASSES = [
@@ -49,6 +50,46 @@ os.makedirs(GRAPH_SAVE_DIR, exist_ok=True)
 # ---------------------------------------------------------
 print("⏳ Loading Data...")
 df = pd.read_csv(CSV_PATH)
+
+# ================================
+# Create Multi-label Columns
+# ================================
+# for cls in CLASSES:
+#     df[cls] = df["Finding Labels"].apply(
+#         lambda x: 1 if cls in str(x).split("|") else 0
+#     )
+
+# train_df = df.sample(frac=0.8, random_state=42)
+# val_df = df.drop(train_df.index)
+
+import glob
+
+# ==================================================
+# Find all image files inside archive
+# ==================================================
+image_paths = glob.glob(
+    os.path.join(ARCHIVE_DIR, "**", "*.png"),
+    recursive=True
+)
+
+image_map = {
+    os.path.basename(path): path
+    for path in image_paths
+}
+
+df["filepath"] = df["Image Index"].map(image_map)
+
+print(f"📁 Images found in folders: {len(image_paths)}")
+print(f"✅ Matched with CSV: {df['filepath'].notna().sum()}")
+print(f"❌ Missing images: {df['filepath'].isna().sum()}")
+
+# เอาเฉพาะแถวที่มีไฟล์ภาพจริง
+df = df[df["filepath"].notna()].copy()
+for cls in CLASSES:
+    df[cls] = df["Finding Labels"].apply(
+        lambda x: 1 if cls in str(x).split("|") else 0
+    )
+
 train_df = df.sample(frac=0.8, random_state=42)
 val_df = df.drop(train_df.index)
 
@@ -208,15 +249,36 @@ val_datagen = ImageDataGenerator(
     # ตอนนี้เพิ่ม CLAHE เข้าไปให้สอดคล้องกับ train_datagen
 )
 
-IMG_DIR = ARCHIVE_DIR
+# IMG_DIR = ARCHIVE_DIR
 
+# train_generator = train_datagen.flow_from_dataframe(
+#     dataframe=train_df, directory=IMG_DIR, x_col='Filename', y_col=CLASSES,
+#     target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='raw', shuffle=True
+# )
+# val_generator = val_datagen.flow_from_dataframe(
+#     dataframe=val_df, directory=IMG_DIR, x_col='Filename', y_col=CLASSES,
+#     target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='raw', shuffle=False
+# )
 train_generator = train_datagen.flow_from_dataframe(
-    dataframe=train_df, directory=IMG_DIR, x_col='Filename', y_col=CLASSES,
-    target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='raw', shuffle=True
+    dataframe=train_df,
+    directory=None,
+    x_col="filepath",
+    y_col=CLASSES,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode="raw",
+    shuffle=True
 )
+
 val_generator = val_datagen.flow_from_dataframe(
-    dataframe=val_df, directory=IMG_DIR, x_col='Filename', y_col=CLASSES,
-    target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='raw', shuffle=False
+    dataframe=val_df,
+    directory=None,
+    x_col="filepath",
+    y_col=CLASSES,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode="raw",
+    shuffle=False
 )
 
 # ==========================================================
