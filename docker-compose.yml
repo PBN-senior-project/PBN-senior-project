@@ -5,7 +5,7 @@ services:
 
     volumes:
       - ./src:/app/src
-      - ./archive:/app/archive
+      - ${ARCHIVE_HOST_PATH}:/app/archive
       - ./outputs:/app/outputs
       - ./models_v7:/app/models_v7
 

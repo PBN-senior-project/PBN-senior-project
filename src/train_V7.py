@@ -18,6 +18,8 @@ mixed_precision.set_global_policy('mixed_float16')
 CSV_PATH = "/app/archive/Data_Entry_2017.csv"
 
 # ARCHIVE_DIR = r"D:\senior-project\ploy-senior-project\archive"
+#ARCHIVE_DIR = "/app/archive"
+CSV_PATH = "/app/archive/Data_Entry_2017.csv"
 ARCHIVE_DIR = "/app/archive"
 
 MODEL_SAVE_DIR = "/app/models_v7"
