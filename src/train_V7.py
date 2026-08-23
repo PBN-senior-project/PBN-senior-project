@@ -335,114 +335,211 @@ def build_model(name):
     return model
 
 # =========================================================
-# Grafana
+# GRAFANA / PROMETHEUS TRAINING MONITOR
 # =========================================================
 class PrometheusTrainingCallback(tf.keras.callbacks.Callback):
-    def __init__(self, model_name, total_images, batch_size):
+
+    def __init__(self, model_name, total_images, batch_size,
+                 total_epochs, total_batches, val_batches):
         super().__init__()
-        self.model_name = model_name
+
+        self.name = model_name
         self.total_images = total_images
         self.batch_size = batch_size
+        self.total_epochs = total_epochs
+        self.total_batches = total_batches
+        self.val_batches = val_batches
+
+        self.model_start = None
+        self.epoch_start = None
+        self.val_start = None
+        self.current_epoch = 0
+        self.val_times = []
+
         self.registry = CollectorRegistry()
 
-        self.epoch = Gauge(
+        # Prometheus metrics
+        metric_names = [
+            "training_status",
             "training_epoch",
-            "Current epoch",
-            ["model"],
-            registry=self.registry
-        )
-
-        self.batch = Gauge(
+            "training_total_epochs",
             "training_batch",
-            "Current batch",
-            ["model"],
-            registry=self.registry
-        )
-
-        self.images = Gauge(
+            "training_total_batches",
             "training_images_processed",
-            "Images processed",
-            ["model"],
-            registry=self.registry
-        )
-
-        self.loss = Gauge(
+            "training_total_images",
+            "training_progress_percent",
             "training_loss",
-            "Training loss",
-            ["model"],
-            registry=self.registry
-        )
-
-        self.auc = Gauge(
             "training_auc",
-            "Training AUC",
-            ["model"],
-            registry=self.registry
-        )
-
-        self.val_loss = Gauge(
             "validation_loss",
-            "Validation loss",
-            ["model"],
-            registry=self.registry
-        )
-
-        self.val_auc = Gauge(
             "validation_auc",
-            "Validation AUC",
-            ["model"],
-            registry=self.registry
-        )
+            "training_seconds_per_step",
+            "training_epoch_elapsed_seconds",
+            "training_train_remaining_seconds",
+            "training_validation_estimate_seconds",
+            "training_next_epoch_eta_timestamp",
+            "training_model_elapsed_seconds",
+            "training_model_remaining_seconds",
+            "training_model_finish_timestamp",
+            "training_last_update_timestamp"
+        ]
+
+        self.m = {
+            name: Gauge(name, name, ["model"], registry=self.registry)
+            for name in metric_names
+        }
+
+    def set(self, name, value):
+        self.m[name].labels(model=self.name).set(float(value))
 
     def push(self):
-        push_to_gateway(
-            "pushgateway:9091",
-            job="chestxray_training",
-            registry=self.registry
-        )
+        try:
+            push_to_gateway(
+                "pushgateway:9091",
+                job="chestxray_training",
+                registry=self.registry
+            )
+        except Exception as e:
+            print("⚠️ Prometheus:", e)
 
-    def on_epoch_begin(self, epoch, logs=None):
-        self.epoch.labels(model=self.model_name).set(epoch + 1)
+    # ---------------- MODEL START ----------------
+    def on_train_begin(self, logs=None):
+        self.model_start = time.time()
+
+        for name, value in {
+            "training_status": 1,
+            "training_total_epochs": self.total_epochs,
+            "training_total_batches": self.total_batches,
+            "training_total_images": self.total_images,
+            "training_last_update_timestamp": self.model_start
+        }.items():
+            self.set(name, value)
+
         self.push()
 
+    # ---------------- EPOCH START ----------------
+    def on_epoch_begin(self, epoch, logs=None):
+        now = time.time()
+        self.current_epoch = epoch + 1
+        self.epoch_start = now
+
+        for name, value in {
+            "training_status": 1,
+            "training_epoch": self.current_epoch,
+            "training_batch": 0,
+            "training_images_processed": 0,
+            "training_progress_percent": 0,
+            "training_last_update_timestamp": now
+        }.items():
+            self.set(name, value)
+
+        self.push()
+
+    # ---------------- TRAIN BATCH ----------------
     def on_train_batch_end(self, batch, logs=None):
         logs = logs or {}
+        now = time.time()
+        b = batch + 1
 
-        self.batch.labels(model=self.model_name).set(batch + 1)
+        elapsed = now - self.epoch_start
+        sec_step = elapsed / b
 
-        images = min(
-            (batch + 1) * self.batch_size,
-            self.total_images
+        remaining = max(self.total_batches - b, 0) * sec_step
+        images = min(b * self.batch_size, self.total_images)
+        progress = b / self.total_batches * 100
+
+        # Epoch 1 ใช้การประมาณ / Epoch ต่อไปใช้เวลา validation จริง
+        val_est = (
+            sum(self.val_times) / len(self.val_times)
+            if self.val_times
+            else self.val_batches * sec_step
         )
-        self.images.labels(model=self.model_name).set(images)
+
+        next_epoch = now + remaining + val_est
+
+        epoch_est = self.total_batches * sec_step + val_est
+        future_epochs = max(self.total_epochs - self.current_epoch, 0)
+
+        model_remaining = (
+            remaining +
+            val_est +
+            future_epochs * epoch_est
+        )
+
+        values = {
+            "training_batch": b,
+            "training_images_processed": images,
+            "training_progress_percent": progress,
+            "training_seconds_per_step": sec_step,
+            "training_epoch_elapsed_seconds": elapsed,
+            "training_train_remaining_seconds": remaining,
+            "training_validation_estimate_seconds": val_est,
+            "training_next_epoch_eta_timestamp": next_epoch,
+            "training_model_elapsed_seconds": now - self.model_start,
+            "training_model_remaining_seconds": model_remaining,
+            "training_model_finish_timestamp": now + model_remaining,
+            "training_last_update_timestamp": now
+        }
 
         if "loss" in logs:
-            self.loss.labels(model=self.model_name).set(logs["loss"])
+            values["training_loss"] = logs["loss"]
 
         if "auc" in logs:
-            self.auc.labels(model=self.model_name).set(logs["auc"])
+            values["training_auc"] = logs["auc"]
 
-        if (batch + 1) % 50 == 0:
+        for name, value in values.items():
+            self.set(name, value)
+
+        # ส่งทุก 50 batch
+        if b == 1 or b % 50 == 0 or b == self.total_batches:
             self.push()
 
+    # ---------------- VALIDATION ----------------
+    def on_test_begin(self, logs=None):
+        self.val_start = time.time()
+        self.set("training_status", 2)
+        self.set("training_last_update_timestamp", self.val_start)
+        self.push()
+
+    def on_test_end(self, logs=None):
+        now = time.time()
+
+        if self.val_start:
+            self.val_times.append(now - self.val_start)
+            self.set(
+                "training_validation_estimate_seconds",
+                sum(self.val_times) / len(self.val_times)
+            )
+
+        self.set("training_status", 1)
+        self.set("training_last_update_timestamp", now)
+        self.push()
+
+    # ---------------- EPOCH END ----------------
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
 
-        self.loss.labels(model=self.model_name).set(
-            logs.get("loss", 0)
-        )
+        metric_map = {
+            "loss": "training_loss",
+            "auc": "training_auc",
+            "val_loss": "validation_loss",
+            "val_auc": "validation_auc"
+        }
 
-        self.auc.labels(model=self.model_name).set(
-            logs.get("auc", 0)
-        )
+        for keras_name, metric_name in metric_map.items():
+            if keras_name in logs:
+                self.set(metric_name, logs[keras_name])
 
-        self.val_loss.labels(model=self.model_name).set(
-            logs.get("val_loss", 0)
-        )
+        self.set("training_last_update_timestamp", time.time())
+        self.push()
 
-        self.val_auc.labels(model=self.model_name).set(
-            logs.get("val_auc", 0)
-        )
+    # ---------------- MODEL END ----------------
+    def on_train_end(self, logs=None):
+        now = time.time()
+
+        self.set("training_status", 3)
+        self.set("training_model_remaining_seconds", 0)
+        self.set("training_model_finish_timestamp", now)
+        self.set("training_last_update_timestamp", now)
 
         self.push()
 
