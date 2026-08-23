@@ -1,495 +1,535 @@
+import os, glob, cv2
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 import tensorflow as tf
+
+from tensorflow.keras import layers, models, optimizers, callbacks, mixed_precision
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import DenseNet121, ResNet50V2, MobileNetV2
-from tensorflow.keras import layers, models, optimizers, callbacks
-import os
-import numpy as np
-from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
 
-# ================= ⚙️ V7 SETUP: Mixed Precision =================
-from tensorflow.keras import mixed_precision
-mixed_precision.set_global_policy('mixed_float16')
-# ================================================================
 
-# ================= ⚙️ CONFIG V7 - 6 DISEASES =================
+# =========================================================
+# CONFIG
+# =========================================================
+# mixed_precision.set_global_policy("mixed_float16") for GPU
+mixed_precision.set_global_policy("float32")
 
-CSV_PATH = "/app/archive/Data_Entry_2017.csv"
-
-# ARCHIVE_DIR = r"D:\senior-project\ploy-senior-project\archive"
-#ARCHIVE_DIR = "/app/archive"
-CSV_PATH = "/app/archive/Data_Entry_2017.csv"
-ARCHIVE_DIR = "/app/archive"
-
+CSV_PATH = "/archive/Data_Entry_2017.csv"
+ARCHIVE_DIR = "/archive"
 MODEL_SAVE_DIR = "/app/models_v7"
 GRAPH_SAVE_DIR = "/app/outputs/graphs_v7"
 
 IMG_SIZE = (384, 384)
 BATCH_SIZE = 8
-EPOCHS = 10 #40
+EPOCHS = 10
 INITIAL_LR = 1e-4
+N_NO_FINDING = 5000
+SEED = 42
 
 CLASSES = [
-    'Infiltration',
-    'Effusion',
-    'Atelectasis',
-    'Nodule',
-    'Mass',
-    'Pneumothorax'
+    "Infiltration",
+    "Effusion",
+    "Atelectasis",
+    "Nodule",
+    "Mass",
+    "Pneumothorax"
 ]
-
-gpus = tf.config.list_physical_devices('GPU')
-for gpu in gpus:
-    tf.config.experimental.set_memory_growth(gpu, True)
 
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 os.makedirs(GRAPH_SAVE_DIR, exist_ok=True)
-# ==================================================
 
-# ---------------------------------------------------------
-# 1️⃣ Load Data
-# ---------------------------------------------------------
+# for gpu in tf.config.list_physical_devices("GPU"):
+#     tf.config.experimental.set_memory_growth(gpu, True)
+
+
+# =========================================================
+# 1. LOAD + SELECT DATA
+# =========================================================
 print("⏳ Loading Data...")
 df = pd.read_csv(CSV_PATH)
 
-# ================================
-# Create Multi-label Columns
-# ================================
-# for cls in CLASSES:
-#     df[cls] = df["Finding Labels"].apply(
-#         lambda x: 1 if cls in str(x).split("|") else 0
-#     )
-
-# train_df = df.sample(frac=0.8, random_state=42)
-# val_df = df.drop(train_df.index)
-
-import glob
-
-# ==================================================
-# Find all image files inside archive
-# ==================================================
 image_paths = glob.glob(
     os.path.join(ARCHIVE_DIR, "**", "*.png"),
     recursive=True
 )
 
-image_map = {
-    os.path.basename(path): path
-    for path in image_paths
-}
-
+image_map = {os.path.basename(p): p for p in image_paths}
 df["filepath"] = df["Image Index"].map(image_map)
 
-print(f"📁 Images found in folders: {len(image_paths)}")
-print(f"✅ Matched with CSV: {df['filepath'].notna().sum()}")
-print(f"❌ Missing images: {df['filepath'].isna().sum()}")
+print(f"📁 Images found : {len(image_paths)}")
+print(f"✅ Matched      : {df['filepath'].notna().sum()}")
+print(f"❌ Missing      : {df['filepath'].isna().sum()}")
 
-# เอาเฉพาะแถวที่มีไฟล์ภาพจริง
+# เอาเฉพาะภาพที่มีไฟล์จริง
 df = df[df["filepath"].notna()].copy()
+
+# ใช้ View Position จาก CSV โดยตรง และเอาเฉพาะ PA / AP
+df["View Position"] = df["View Position"].astype(str).str.strip()
+df = df[df["View Position"].isin(["PA", "AP"])].copy()
+
+print("\n📌 View Position:")
+print(df["View Position"].value_counts())
+
+# สร้าง Multi-label สำหรับ 6 findings
+labels = df["Finding Labels"].fillna("").str.split("|")
+
 for cls in CLASSES:
-    df[cls] = df["Finding Labels"].apply(
-        lambda x: 1 if cls in str(x).split("|") else 0
-    )
+    df[cls] = labels.apply(lambda x: int(cls in x))
 
-train_df = df.sample(frac=0.8, random_state=42)
-val_df = df.drop(train_df.index)
+# Positive = มีอย่างน้อย 1 ใน 6 findings
+positive_df = df[df[CLASSES].sum(axis=1) > 0].copy()
 
-# ---------------------------------------------------------
-# ⭐ [V7 UPDATE] 1.5 Targeted Minority Oversampling
-# แก้ปัญหา Imbalance ที่ระดับ Data (จาก Irtaza 2024)
-# ---------------------------------------------------------
-print("\n Applying Targeted Oversampling for Minority Classes...")
-class_counts = train_df[CLASSES].sum()
-# หาโรคหายากที่มีตัวอย่างน้อยกว่า 2000 รูปใน Training set
-minority_classes = class_counts[class_counts < 2000].index.tolist()
-print(f"   🎯 Minority Classes to Oversample: {minority_classes}")
+# Negative = No Finding
+negative_df = df[df["Finding Labels"].eq("No Finding")].copy()
 
-# ดึงแถวที่มีโรคหายากออกมา
-minority_df = train_df[train_df[minority_classes].sum(axis=1) > 0]
-# ทำการ Copy ข้อมูลกลุ่มนี้เพิ่ม 1 เท่าตัว (Oversampling)
-train_df_balanced = pd.concat([train_df, minority_df], ignore_index=True)
-# สลับข้อมูลให้กระจายตัว
-train_df = train_df_balanced.sample(frac=1, random_state=42).reset_index(drop=True)
-print(f"   📈 Train data size increased from {len(df)*0.8:.0f} to {len(train_df)} images.\n")
-
-# ---------------------------------------------------------
-# 2️⃣ SOTA Algorithm: Weighted Focal Loss
-# ---------------------------------------------------------
-pos_counts = train_df[CLASSES].sum().values 
-total = len(train_df)
-# คำนวณ Weights จาก Dataset ที่ปรับสมดุลแล้ว
-weight_values = (total / (pos_counts + 1e-5)) / 2.0 
-pos_weights_tensor = tf.constant(weight_values, dtype=tf.float32)
-
-def weighted_focal_loss(pos_weights, gamma=2.0):
-    def loss_fn(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        epsilon = 1e-7
-        y_pred = tf.clip_by_value(y_pred, epsilon, 1. - epsilon)
-
-        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
-        modulating_factor = tf.pow(1.0 - p_t, gamma)
-        alpha_factor = y_true * pos_weights + (1 - y_true) * 1.0 
-
-        loss = -alpha_factor * modulating_factor * tf.math.log(p_t)
-        return tf.reduce_mean(loss)
-    return loss_fn
-
-# ---------------------------------------------------------
-# ⭐ [V7 UPDATE] 3️⃣ Generators & Medical Augmentation
-# ---------------------------------------------------------
-import cv2  # ⭐ [V7 UPDATE - เพิ่มใหม่] ใช้สำหรับทำ CLAHE (Adaptive Windowing)
-
-# ==========================================================
-# ⭐ [V7 UPDATE - เพิ่มใหม่ทั้งฟังก์ชัน] Custom Preprocessing
-# รวม 3 เทคนิค: CLAHE + Gamma Correction + Gaussian Noise
-# ทำงานหลัง rescale (ภาพเป็น float32 ช่วง 0-1) จึงต้อง denormalize
-# ก่อนใช้ OpenCV แล้วค่อย normalize กลับ
-# ==========================================================
-def medical_preprocessing(img):
-    # ImageDataGenerator ส่งภาพเข้าฟังก์ชันนี้ก่อน rescale
-    # ดังนั้น input ยังอยู่ช่วงประมาณ 0-255
-    img_uint8 = np.clip(img, 0, 255).astype(np.uint8)
-
-    # ⭐ เทคนิคที่ 1: CLAHE
-    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    lab = cv2.merge((l, a, b))
-    img_uint8 = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-    # ⭐ เทคนิคที่ 2: Safe Random Cropping
-    # Crop เบา ๆ 384x384 -> 368x368 แล้ว resize กลับ
-    h, w = img_uint8.shape[:2]
-    crop_h = min(368, h)
-    crop_w = min(368, w)
-
-    if h > crop_h:
-        top = np.random.randint(0, h - crop_h + 1)
-    else:
-        top = 0
-
-    if w > crop_w:
-        left = np.random.randint(0, w - crop_w + 1)
-    else:
-        left = 0
-
-    img_uint8 = img_uint8[
-        top:top + crop_h,
-        left:left + crop_w
-    ]
-
-    img_uint8 = cv2.resize(
-        img_uint8,
-        IMG_SIZE,
-        interpolation=cv2.INTER_LINEAR
-    )
-
-    # Normalize เป็น 0-1
-    img = img_uint8.astype(np.float32) / 255.0
-
-    # ⭐ เทคนิคที่ 3: Gamma Correction
-    gamma = np.random.uniform(0.85, 1.15)
-    img = np.power(img, gamma)
-
-    # ⭐ เทคนิคที่ 4: Gaussian Noise
-    if np.random.rand() < 0.5:
-        noise = np.random.normal(
-            0,
-            0.01,
-            img.shape
-        ).astype(np.float32)
-        img = img + noise
-
-    img = np.clip(img, 0.0, 1.0)
-    return img
-
-
-# เอา Brightness ออก และลดการขยับลงครึ่งหนึ่งให้พอดีกับสรีระปอด
-train_datagen = ImageDataGenerator(
-    rotation_range=10,        # ลดจาก 15
-    width_shift_range=0.05,   # ลดจาก 0.1
-    height_shift_range=0.05,  # ลดจาก 0.1
-    zoom_range=0.1,           # ลดจาก 0.15
-    shear_range=5,             # ⭐ [V7 UPDATE - เพิ่มใหม่]
-                                # เทคนิค: Shear (บิดภาพตามแนวทแยงเล็กน้อย)
-                                # ผลที่ได้: จำลองมุมถ่ายที่เอียงเล็กน้อยจาก
-                                # ท่ายืน/นั่งของผู้ป่วยตอนถ่ายฟิล์ม ใส่แค่ 5 องศา (น้อยกว่าค่า default ทั่วไป) เพราะปอด
-                                # มีโครงสร้างตายตัว บิดมากไปจะผิดกายวิภาค
-    fill_mode='constant', cval=0,
-    horizontal_flip=True,      # คงไว้ตามเปเปอร์ CheXNet (Stanford)
-    preprocessing_function=medical_preprocessing
-    # ⭐ [V7 UPDATE - เพิ่มใหม่] เรียกใช้ฟังก์ชันด้านบน
-    # ผลรวม: เพิ่ม CLAHE + Gamma + Gaussian Noise เข้าไปใน pipeline
-    # ของ train_datagen ทำงานหลัง rescale ทุกครั้งที่สุ่มภาพมา train
+# จำกัด No Finding
+negative_df = negative_df.sample(
+    n=min(N_NO_FINDING, len(negative_df)),
+    random_state=SEED
 )
 
-# ⭐ [V7 UPDATE - เพิ่มใหม่ทั้งฟังก์ชัน] Preprocessing สำหรับ validation/TTA
-# ใช้ CLAHE เหมือนกัน (deterministic) แต่ "ไม่" ใส่ gamma/noise แบบสุ่ม
-# เหตุผล: ตอน validate ต้องการผลลัพธ์ที่ reproducible ทุกครั้ง ไม่อยาก
-# ให้ metric แกว่งเพราะ noise สุ่ม แต่ต้องการให้ contrast ของภาพ (CLAHE)
-# สอดคล้องกับที่โมเดลเห็นตอน train เพื่อไม่ให้เกิด distribution mismatch
-def val_preprocessing(img):
-    # Validation ใช้ CLAHE เหมือน train แต่ไม่มี Random Crop / Gamma / Noise
-    img_uint8 = np.clip(img, 0, 255).astype(np.uint8)
+# รวม Positive + Negative แล้ว shuffle
+selected_df = pd.concat(
+    [positive_df, negative_df],
+    ignore_index=True
+).sample(
+    frac=1,
+    random_state=SEED
+).reset_index(drop=True)
 
-    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
+print(f"\n📦 Selected : {len(selected_df)} images")
+print(f"👤 Patients : {selected_df['Patient ID'].nunique()}")
+
+
+# =========================================================
+# 2. PATIENT-LEVEL SPLIT
+# =========================================================
+patients = selected_df["Patient ID"].unique()
+
+train_patients, val_patients = train_test_split(
+    patients,
+    test_size=0.2,
+    random_state=SEED
+)
+
+train_df = selected_df[
+    selected_df["Patient ID"].isin(train_patients)
+].copy()
+
+val_df = selected_df[
+    selected_df["Patient ID"].isin(val_patients)
+].copy()
+
+overlap = set(train_df["Patient ID"]) & set(val_df["Patient ID"])
+assert not overlap, "❌ Patient leakage detected!"
+
+print(f"\n✅ Train : {len(train_df)}")
+print(f"✅ Val   : {len(val_df)}")
+print(f"✅ Patient overlap : {len(overlap)}")
+
+
+def show_distribution(data, name):
+    print(f"\n📊 {name}")
+    for cls in CLASSES:
+        pos = data[data[cls] == 1]["View Position"].value_counts()
+        pa, ap = pos.get("PA", 0), pos.get("AP", 0)
+        print(f"{cls:15} PA={pa:5} AP={ap:5} Total={pa + ap:5}")
+
+
+show_distribution(train_df, "TRAIN BEFORE OVERSAMPLING")
+show_distribution(val_df, "VALIDATION")
+
+
+# =========================================================
+# 3. TARGETED OVERSAMPLING — TRAIN ONLY
+# =========================================================
+before = len(train_df)
+
+class_counts = train_df[CLASSES].sum()
+minority_classes = class_counts[class_counts < 2000].index.tolist()
+
+print(f"\n🎯 Minority classes: {minority_classes}")
+
+if minority_classes:
+    minority_df = train_df[
+        train_df[minority_classes].sum(axis=1) > 0
+    ]
+
+    train_df = pd.concat(
+        [train_df, minority_df],
+        ignore_index=True
+    ).sample(frac=1, random_state=SEED).reset_index(drop=True)
+
+print(f"📈 Train: {before} → {len(train_df)} images")
+
+
+# =========================================================
+# 4. WEIGHTED FOCAL LOSS
+# =========================================================
+pos_counts = train_df[CLASSES].sum().values
+weights = len(train_df) / (2.0 * (pos_counts + 1e-5))
+pos_weights = tf.constant(weights, dtype=tf.float32)
+
+
+def weighted_focal_loss(pos_weights, gamma=2.0):
+    def loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.clip_by_value(
+            tf.cast(y_pred, tf.float32),
+            1e-7,
+            1 - 1e-7
+        )
+
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        alpha = y_true * pos_weights + (1 - y_true)
+
+        return tf.reduce_mean(
+            -alpha * tf.pow(1 - p_t, gamma) * tf.math.log(p_t)
+        )
+    return loss
+
+
+# =========================================================
+# 5. IMAGE PREPROCESSING
+# =========================================================
+def apply_clahe(img):
+    img = np.clip(img, 0, 255).astype(np.uint8)
+
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    lab = cv2.merge((l, a, b))
-    img_uint8 = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-    return img_uint8.astype(np.float32) / 255.0
+    l = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    ).apply(l)
+
+    return cv2.cvtColor(
+        cv2.merge((l, a, b)),
+        cv2.COLOR_LAB2RGB
+    )
+
+
+def medical_preprocessing(img):
+    img = apply_clahe(img)
+
+    # Random crop 384 → 368 → 384
+    h, w = img.shape[:2]
+    ch, cw = min(368, h), min(368, w)
+
+    top = np.random.randint(0, h - ch + 1) if h > ch else 0
+    left = np.random.randint(0, w - cw + 1) if w > cw else 0
+
+    img = img[top:top + ch, left:left + cw]
+    img = cv2.resize(img, IMG_SIZE).astype(np.float32) / 255.0
+
+    # Gamma
+    img = np.power(img, np.random.uniform(0.85, 1.15))
+
+    # Gaussian Noise 50%
+    if np.random.rand() < 0.5:
+        img += np.random.normal(
+            0, 0.01, img.shape
+        ).astype(np.float32)
+
+    return np.clip(img, 0, 1)
+
+
+def val_preprocessing(img):
+    return apply_clahe(img).astype(np.float32) / 255.0
+
+
+# =========================================================
+# 6. DATA GENERATORS
+# =========================================================
+train_datagen = ImageDataGenerator(
+    rotation_range=10,
+    width_shift_range=0.05,
+    height_shift_range=0.05,
+    zoom_range=0.1,
+    shear_range=5,
+    horizontal_flip=True,
+    fill_mode="constant",
+    cval=0,
+    preprocessing_function=medical_preprocessing
+)
 
 val_datagen = ImageDataGenerator(
     preprocessing_function=val_preprocessing
-    # ⭐ [V7 UPDATE - เพิ่มใหม่] เดิมมีแค่ rescale=1./255 บรรทัดเดียว
-    # ตอนนี้เพิ่ม CLAHE เข้าไปให้สอดคล้องกับ train_datagen
 )
 
-# IMG_DIR = ARCHIVE_DIR
-
-# train_generator = train_datagen.flow_from_dataframe(
-#     dataframe=train_df, directory=IMG_DIR, x_col='Filename', y_col=CLASSES,
-#     target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='raw', shuffle=True
-# )
-# val_generator = val_datagen.flow_from_dataframe(
-#     dataframe=val_df, directory=IMG_DIR, x_col='Filename', y_col=CLASSES,
-#     target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='raw', shuffle=False
-# )
-train_generator = train_datagen.flow_from_dataframe(
-    dataframe=train_df,
+generator_args = dict(
     directory=None,
     x_col="filepath",
     y_col=CLASSES,
     target_size=IMG_SIZE,
     batch_size=BATCH_SIZE,
-    class_mode="raw",
-    shuffle=True
+    class_mode="raw"
+)
+
+train_generator = train_datagen.flow_from_dataframe(
+    dataframe=train_df,
+    shuffle=True,
+    **generator_args
 )
 
 val_generator = val_datagen.flow_from_dataframe(
     dataframe=val_df,
-    directory=None,
-    x_col="filepath",
-    y_col=CLASSES,
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode="raw",
-    shuffle=False
+    shuffle=False,
+    **generator_args
 )
 
-# ==========================================================
-# ⭐ [V7 UPDATE - เพิ่มใหม่ทั้ง block] Test-Time Augmentation (TTA)
-# เทคนิค: TTA (สร้าง generator ที่ 2 ของชุด validation เดิม 
-# แต่เพิ่มการ Shift และ Flip เข้าไปแบบสุ่ม)
-# ผลที่ได้: ตอน evaluation/ensemble (section 7) จะ predict ภาพหลายเวอร์ชัน
-# (ภาพจริง + ภาพที่ผ่าน shift/flip) แล้วเอาผลมาเฉลี
-# ---------------------------------------------------------
-# 4️⃣ Model Builder
-# ---------------------------------------------------------
-def build_model(model_name):
-    input_shape = (IMG_SIZE[0], IMG_SIZE[1], 3)
-    if model_name == 'DenseNet121':
-        base = DenseNet121(include_top=False, weights='imagenet', input_shape=input_shape)
-    elif model_name == 'ResNet50V2':
-        base = ResNet50V2(include_top=False, weights='imagenet', input_shape=input_shape)
-    elif model_name == 'MobileNetV2':
-        base = MobileNetV2(include_top=False, weights='imagenet', input_shape=input_shape)
+
+# =========================================================
+# 7. MODEL
+# =========================================================
+BACKBONES = {
+    "DenseNet121": DenseNet121,
+    "ResNet50V2": ResNet50V2,
+    "MobileNetV2": MobileNetV2
+}
+
+
+def build_model(name):
+    base = BACKBONES[name](
+        include_top=False,
+        weights="imagenet",
+        input_shape=(*IMG_SIZE, 3)
+    )
 
     base.trainable = True
-    for layer in base.layers[:-120]: 
+
+    for layer in base.layers[:-120]:
         layer.trainable = False
 
     x = layers.GlobalAveragePooling2D()(base.output)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(0.5)(x)
-    outputs = layers.Dense(len(CLASSES), activation='sigmoid', dtype='float32')(x)
 
-    model = models.Model(inputs=base.input, outputs=outputs, name=model_name)
-    
-    # [V7 UPDATE] ใช้ AdamW ด้วย LR คงที่เพื่อใช้ร่วมกับ ReduceLROnPlateau
-    optimizer = optimizers.AdamW(learning_rate=INITIAL_LR, weight_decay=1e-4)
+    output = layers.Dense(
+        len(CLASSES),
+        activation="sigmoid",
+        dtype="float32"
+    )(x)
 
-    model.compile(optimizer=optimizer,
-                  loss=weighted_focal_loss(pos_weights_tensor, gamma=2.0),
-                  metrics=[tf.keras.metrics.AUC(multi_label=True, name='auc')])
+    model = models.Model(base.input, output, name=name)
+
+    model.compile(
+        optimizer=optimizers.AdamW(
+            learning_rate=INITIAL_LR,
+            weight_decay=1e-4
+        ),
+        loss=weighted_focal_loss(pos_weights),
+        metrics=[
+            tf.keras.metrics.AUC(
+                multi_label=True,
+                name="auc"
+            )
+        ]
+    )
+
     return model
 
-# ---------------------------------------------------------
-# 🚀 5️⃣ MAIN TRAINING LOOP & HISTORY TRACKING
-# ---------------------------------------------------------
-MODELS_TO_TRAIN = ['DenseNet121', 'ResNet50V2', 'MobileNetV2']
-saved_model_paths = []
-history_dict = {} 
 
-print("\n" + "="*50)
-print("🚀 STARTING V7 FINAL THESIS TRAINING")
-print("="*50)
+# =========================================================
+# 8. TRAIN 3 MODELS
+# =========================================================
+MODEL_NAMES = ["DenseNet121", "ResNet50V2", "MobileNetV2"]
+saved_paths = []
+history_dict = {}
 
-for m_name in MODELS_TO_TRAIN:
-    print(f"\n🧠 Training Base Model: {m_name}")
-    model = build_model(m_name)
-    
-    save_path = os.path.join(MODEL_SAVE_DIR, f'best_{m_name}_v7.keras')
-    saved_model_paths.append(save_path)
-    
-    # ⭐ [V7 UPDATE] ใช้ ReduceLROnPlateau ตามเปเปอร์ CheXNet
-    callbacks_list = [
-        callbacks.EarlyStopping(monitor='val_auc', mode='max', patience=5, restore_best_weights=True),
-        callbacks.ReduceLROnPlateau(monitor='val_auc', mode='max', factor=0.1, patience=2, min_lr=1e-6, verbose=1),
-        callbacks.ModelCheckpoint(save_path, monitor='val_auc', save_best_only=True, mode='max', verbose=1)
+for name in MODEL_NAMES:
+    print(f"\n🧠 Training {name}")
+
+    model = build_model(name)
+    path = os.path.join(
+        MODEL_SAVE_DIR,
+        f"best_{name}_v7.keras"
+    )
+    saved_paths.append(path)
+
+    cb = [
+        callbacks.EarlyStopping(
+            monitor="val_auc",
+            mode="max",
+            patience=5,
+            restore_best_weights=True
+        ),
+        callbacks.ReduceLROnPlateau(
+            monitor="val_auc",
+            mode="max",
+            factor=0.1,
+            patience=2,
+            min_lr=1e-6,
+            verbose=1
+        ),
+        callbacks.ModelCheckpoint(
+            path,
+            monitor="val_auc",
+            mode="max",
+            save_best_only=True,
+            verbose=1
+        )
     ]
-    
-    history = model.fit(train_generator, epochs=EPOCHS, validation_data=val_generator, callbacks=callbacks_list)
-    history_dict[m_name] = history.history['val_auc']
-    
+
+    history = model.fit(
+        train_generator,
+        validation_data=val_generator,
+        epochs=EPOCHS,
+        callbacks=cb
+    )
+
+    history_dict[name] = history.history["val_auc"]
+
     del model
     tf.keras.backend.clear_session()
-    print(f"✅ Finished & Saved: {m_name}. VRAM Cleared.")
 
-# ---------------------------------------------------------
-# 📈 6️⃣ PLOT TRAINING CURVES
-# ---------------------------------------------------------
-print("\n📊 Generating Validation AUC Comparison Graph...")
-plt.figure(figsize=(12, 8))
-for m_name, val_auc_scores in history_dict.items():
-    plt.plot(val_auc_scores, label=f'{m_name}', linewidth=2.5, marker='o')
 
-plt.title('V7 Validation AUC Comparison (14 Diseases)', fontsize=16, fontweight='bold')
-plt.xlabel('Epochs', fontsize=12)
-plt.ylabel('Validation AUC Score', fontsize=12)
-plt.legend(fontsize=12)
-plt.grid(True, linestyle='--', alpha=0.7)
+# =========================================================
+# 9. TRAINING GRAPH
+# =========================================================
+plt.figure(figsize=(10, 6))
 
-graph_path = os.path.join(GRAPH_SAVE_DIR, 'training_comparison_v7.png')
-plt.savefig(graph_path, bbox_inches='tight', dpi=300)
-print(f"✅ Graph saved to: {graph_path}")
+for name, values in history_dict.items():
+    plt.plot(values, marker="o", label=name)
+
+plt.title("V7 Validation AUC Comparison (6 Findings)")
+plt.xlabel("Epoch")
+plt.ylabel("Validation AUC")
+plt.legend()
+plt.grid(alpha=0.3)
+
+plt.savefig(
+    os.path.join(
+        GRAPH_SAVE_DIR,
+        "training_comparison_v7.png"
+    ),
+    bbox_inches="tight",
+    dpi=300
+)
+
 plt.close()
 
-# # ---------------------------------------------------------
-# # 👑 7️⃣ THE 4TH MODEL: ENSEMBLE EVALUATION
-# # ---------------------------------------------------------
-# print("\n" + "🌟"*25)
-# print("👑 EVALUATING THE ULTIMATE ENSEMBLE MODEL (V7)")
-# print("🌟"*25)
 
-# y_true = val_generator.labels[:val_generator.samples]
-# ensemble_preds = np.zeros((val_generator.samples, len(CLASSES)))
-
-# for path in saved_model_paths:
-#     print(f"⏳ Running Inference with: {os.path.basename(path)}")
-#     model = tf.keras.models.load_model(path, compile=False)
-#     preds = model.predict(val_generator, steps=len(val_generator), verbose=1)
-#     ensemble_preds += preds[:val_generator.samples]
-#     del model
-#     tf.keras.backend.clear_session()
-
-# ensemble_preds = ensemble_preds / len(saved_model_paths)
-
-# print("\n📊 V7 ENSEMBLE AUC SCORES (14 DISEASES):")
-# print("-" * 40)
-# individual_aucs = []
-# for i, disease in enumerate(CLASSES):
-#     try:
-#         auc = roc_auc_score(y_true[:, i], ensemble_preds[:, i])
-#         individual_aucs.append(auc)
-#         print(f"   {disease:20} : {auc:.4f}")
-#     except ValueError:
-#         print(f"   {disease:20} : N/A")
-
-# macro_auc = np.mean(individual_aucs)
-# print("-" * 40)
-# print(f"🏆 V7 THESIS ENSEMBLE MACRO AUC: {macro_auc:.4f}")
-# print("=" * 50)
-# print("🎉 ภารกิจเสร็จสิ้น! V7 พร้อมสำหรับขึ้นพรีเซนต์จบแล้วครับ!")
-
-# ---------------------------------------------------------
-# 👑 7️⃣ THE 4TH MODEL: ENSEMBLE EVALUATION & SAVE RESULTS
-# ---------------------------------------------------------
-from sklearn.metrics import classification_report, confusion_matrix
-import seaborn as sns
-
-print("\n" + "🌟"*25)
-print("👑 EVALUATING THE ULTIMATE ENSEMBLE MODEL (V7)")
-print("🌟"*25)
-
+# =========================================================
+# 10. ENSEMBLE
+# =========================================================
 y_true = val_generator.labels[:val_generator.samples]
-ensemble_preds = np.zeros((val_generator.samples, len(CLASSES)))
+ensemble_preds = np.zeros(
+    (val_generator.samples, len(CLASSES))
+)
 
-for path in saved_model_paths:
-    print(f"⏳ Running Inference with: {os.path.basename(path)}")
-    model = tf.keras.models.load_model(path, compile=False)
-    preds = model.predict(val_generator, steps=len(val_generator), verbose=1)
+for path in saved_paths:
+    print(f"⏳ Predicting: {os.path.basename(path)}")
+
+    model = tf.keras.models.load_model(
+        path,
+        compile=False
+    )
+
+    preds = model.predict(
+        val_generator,
+        verbose=1
+    )
+
     ensemble_preds += preds[:val_generator.samples]
+
     del model
     tf.keras.backend.clear_session()
 
-ensemble_preds = ensemble_preds / len(saved_model_paths)
+ensemble_preds /= len(saved_paths)
 
-# ==========================================
-# 💾 1. คำนวณและเซฟคะแนน AUC (เป็นไฟล์ .txt)
-# ==========================================
-print("\n📊 V7 ENSEMBLE AUC SCORES (14 DISEASES):")
-print("-" * 40)
-individual_aucs = []
-auc_log_text = "V7 ENSEMBLE AUC SCORES (14 DISEASES):\n" + "-"*40 + "\n"
+
+# =========================================================
+# 11. AUC
+# =========================================================
+auc_lines = ["V7 ENSEMBLE AUC SCORES (6 FINDINGS)", "-" * 40]
+aucs = []
 
 for i, disease in enumerate(CLASSES):
     try:
-        auc = roc_auc_score(y_true[:, i], ensemble_preds[:, i])
-        individual_aucs.append(auc)
-        line = f"   {disease:20} : {auc:.4f}"
-        print(line)
-        auc_log_text += line + "\n"
+        auc = roc_auc_score(
+            y_true[:, i],
+            ensemble_preds[:, i]
+        )
+        aucs.append(auc)
+        auc_lines.append(f"{disease:20}: {auc:.4f}")
+
     except ValueError:
-        individual_aucs.append(0.0)
-        line = f"   {disease:20} : N/A"
-        print(line)
-        auc_log_text += line + "\n"
+        auc_lines.append(f"{disease:20}: N/A")
 
-macro_auc = np.mean(individual_aucs)
-summary_line = f"\n🏆 V7 THESIS ENSEMBLE MACRO AUC: {macro_auc:.4f}\n"
-print("-" * 40)
-print(summary_line)
-auc_log_text += "-"*40 + summary_line
+macro_auc = np.mean(aucs) if aucs else float("nan")
+auc_lines.append(f"\nMACRO AUC: {macro_auc:.4f}")
 
-# เขียนไฟล์ AUC_Scores.txt
-with open(os.path.join(GRAPH_SAVE_DIR, 'V7_AUC_Scores.txt'), 'w') as f:
-    f.write(auc_log_text)
+auc_text = "\n".join(auc_lines)
+print("\n" + auc_text)
 
-# ==========================================
-# 💾 2. คำนวณและเซฟ Classification Report (เป็นไฟล์ .txt)
-# ==========================================
-y_pred_binary = (ensemble_preds > 0.5).astype(int)
-report = classification_report(y_true, y_pred_binary, target_names=CLASSES, zero_division=0)
+with open(
+    os.path.join(GRAPH_SAVE_DIR, "V7_AUC_Scores.txt"),
+    "w"
+) as f:
+    f.write(auc_text)
 
-# เขียนไฟล์ Classification_Report.txt
-with open(os.path.join(GRAPH_SAVE_DIR, 'V7_Classification_Report.txt'), 'w') as f:
-    f.write("V7 ENSEMBLE - CLASSIFICATION REPORT (Threshold 0.5)\n\n")
+
+# =========================================================
+# 12. CLASSIFICATION REPORT + CONFUSION MATRICES
+# =========================================================
+y_pred = (ensemble_preds > 0.5).astype(int)
+
+report = classification_report(
+    y_true,
+    y_pred,
+    target_names=CLASSES,
+    zero_division=0
+)
+
+with open(
+    os.path.join(
+        GRAPH_SAVE_DIR,
+        "V7_Classification_Report.txt"
+    ),
+    "w"
+) as f:
+    f.write(
+        "V7 ENSEMBLE - CLASSIFICATION REPORT "
+        "(Threshold 0.5)\n\n"
+    )
     f.write(report)
 
-# ==========================================
-# 💾 3. วาดและเซฟ Confusion Matrix (เป็นรูป .png ครบ 14 โรค)
-# ==========================================
-cm_dir = os.path.join(GRAPH_SAVE_DIR, 'Confusion_Matrices')
+
+cm_dir = os.path.join(
+    GRAPH_SAVE_DIR,
+    "Confusion_Matrices"
+)
 os.makedirs(cm_dir, exist_ok=True)
 
 for i, disease in enumerate(CLASSES):
-    cm = confusion_matrix(y_true[:, i], y_pred_binary[:, i])
+    cm = confusion_matrix(
+        y_true[:, i],
+        y_pred[:, i]
+    )
+
     plt.figure(figsize=(5, 4))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
-    plt.title(f'Confusion Matrix: {disease}')
-    plt.ylabel('Actual (หมอเฉลย)')
-    plt.xlabel('Predicted (AI ทาย)')
-    
-    # เซฟรูป
-    plt.savefig(os.path.join(cm_dir, f'CM_{disease}.png'), bbox_inches='tight', dpi=150)
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        cbar=False
+    )
+
+    plt.title(f"Confusion Matrix: {disease}")
+    plt.ylabel("Actual")
+    plt.xlabel("Predicted")
+
+    plt.savefig(
+        os.path.join(cm_dir, f"CM_{disease}.png"),
+        bbox_inches="tight",
+        dpi=150
+    )
     plt.close()
 
-print(f"\n✅ เซฟผลการทดลองทั้งหมด (AUC, Report, CM) ไว้ที่โฟลเดอร์: {GRAPH_SAVE_DIR} เรียบร้อยแล้วครับ!")
-print("=" * 50)
+print(f"\n✅ Results saved: {GRAPH_SAVE_DIR}")
