@@ -10,6 +10,7 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import DenseNet121, ResNet50V2, MobileNetV2
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 
 
 # =========================================================
@@ -333,6 +334,117 @@ def build_model(name):
 
     return model
 
+# =========================================================
+# Grafana
+# =========================================================
+class PrometheusTrainingCallback(tf.keras.callbacks.Callback):
+    def __init__(self, model_name, total_images, batch_size):
+        super().__init__()
+        self.model_name = model_name
+        self.total_images = total_images
+        self.batch_size = batch_size
+        self.registry = CollectorRegistry()
+
+        self.epoch = Gauge(
+            "training_epoch",
+            "Current epoch",
+            ["model"],
+            registry=self.registry
+        )
+
+        self.batch = Gauge(
+            "training_batch",
+            "Current batch",
+            ["model"],
+            registry=self.registry
+        )
+
+        self.images = Gauge(
+            "training_images_processed",
+            "Images processed",
+            ["model"],
+            registry=self.registry
+        )
+
+        self.loss = Gauge(
+            "training_loss",
+            "Training loss",
+            ["model"],
+            registry=self.registry
+        )
+
+        self.auc = Gauge(
+            "training_auc",
+            "Training AUC",
+            ["model"],
+            registry=self.registry
+        )
+
+        self.val_loss = Gauge(
+            "validation_loss",
+            "Validation loss",
+            ["model"],
+            registry=self.registry
+        )
+
+        self.val_auc = Gauge(
+            "validation_auc",
+            "Validation AUC",
+            ["model"],
+            registry=self.registry
+        )
+
+    def push(self):
+        push_to_gateway(
+            "pushgateway:9091",
+            job="chestxray_training",
+            registry=self.registry
+        )
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.epoch.labels(model=self.model_name).set(epoch + 1)
+        self.push()
+
+    def on_train_batch_end(self, batch, logs=None):
+        logs = logs or {}
+
+        self.batch.labels(model=self.model_name).set(batch + 1)
+
+        images = min(
+            (batch + 1) * self.batch_size,
+            self.total_images
+        )
+        self.images.labels(model=self.model_name).set(images)
+
+        if "loss" in logs:
+            self.loss.labels(model=self.model_name).set(logs["loss"])
+
+        if "auc" in logs:
+            self.auc.labels(model=self.model_name).set(logs["auc"])
+
+        if (batch + 1) % 50 == 0:
+            self.push()
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+
+        self.loss.labels(model=self.model_name).set(
+            logs.get("loss", 0)
+        )
+
+        self.auc.labels(model=self.model_name).set(
+            logs.get("auc", 0)
+        )
+
+        self.val_loss.labels(model=self.model_name).set(
+            logs.get("val_loss", 0)
+        )
+
+        self.val_auc.labels(model=self.model_name).set(
+            logs.get("val_auc", 0)
+        )
+
+        self.push()
 
 # =========================================================
 # 8. TRAIN 3 MODELS
@@ -345,10 +457,18 @@ for name in MODEL_NAMES:
     print(f"\n🧠 Training {name}")
 
     model = build_model(name)
+
+    monitor_cb = PrometheusTrainingCallback(
+        model_name=name,
+        total_images=len(train_df),
+        batch_size=BATCH_SIZE
+    )
+
     path = os.path.join(
         MODEL_SAVE_DIR,
         f"best_{name}_v7.keras"
     )
+
     saved_paths.append(path)
 
     cb = [
@@ -358,6 +478,7 @@ for name in MODEL_NAMES:
             patience=5,
             restore_best_weights=True
         ),
+
         callbacks.ReduceLROnPlateau(
             monitor="val_auc",
             mode="max",
@@ -366,13 +487,16 @@ for name in MODEL_NAMES:
             min_lr=1e-6,
             verbose=1
         ),
+
         callbacks.ModelCheckpoint(
             path,
             monitor="val_auc",
             mode="max",
             save_best_only=True,
             verbose=1
-        )
+        ),
+
+        monitor_cb
     ]
 
     history = model.fit(

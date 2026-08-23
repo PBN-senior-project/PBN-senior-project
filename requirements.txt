@@ -6,3 +6,5 @@ scikit-learn
 seaborn
 pillow
 opencv-python-headless
+requests
+prometheus-client
