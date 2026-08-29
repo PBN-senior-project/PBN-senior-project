@@ -1,250 +1,416 @@
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score,
+    precision_score, recall_score, f1_score
+)
+
+CLASSES = [
+    "Infiltration", "Effusion", "Atelectasis",
+    "Nodule", "Mass", "Pneumothorax"
+]
+
+IMG_SIZE = 384
+BATCH_SIZE = 8
+SEED = 42
+THRESHOLD = 0.5
+N_NO_FINDING = 5000
 
 
-# -----------------------------
-# Common utils (lightweight)
-# -----------------------------
-def project_root() -> Path:
+def root():
     return Path(__file__).resolve().parents[1]
 
-def ensure_dir(path: Path):
-    path.mkdir(parents=True, exist_ok=True)
 
-def list_images_recursive(root_dir: Path, exts=(".png", ".jpg", ".jpeg")) -> Dict[str, str]:
-    mapping = {}
-    for fp in root_dir.rglob("*"):
-        if fp.is_file() and fp.suffix.lower() in exts:
-            mapping[fp.name] = str(fp.resolve())
-    return mapping
+def find_images(folder):
+    return {
+        p.name: str(p.resolve())
+        for p in folder.rglob("*.png")
+    }
 
-def load_list_file(list_path: str) -> List[str]:
-    lines = []
-    with open(list_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                lines.append(Path(line).name)
-    return lines
 
-def labels_to_multihot(finding_labels: str, classes: List[str]) -> np.ndarray:
-    s = str(finding_labels) if finding_labels is not None else ""
-    parts = [x.strip() for x in s.split("|") if x.strip()]
-    parts_set = set(parts)
-    y = np.zeros((len(classes),), dtype=np.float32)
-    for i, c in enumerate(classes):
-        if c in parts_set:
-            y[i] = 1.0
-    return y
+def preprocess_np(path):
+    path = path.numpy().decode()
+    img = cv2.imread(path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
 
-def decode_image(path: tf.Tensor, img_size: int) -> tf.Tensor:
-    raw = tf.io.read_file(path)
-    img = tf.image.decode_image(raw, channels=3, expand_animations=False)
-    img = tf.image.convert_image_dtype(img, tf.float32)  # [0,1]
-    img = tf.image.resize(img, (img_size, img_size), antialias=True)
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+
+    l = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    ).apply(l)
+
+    img = cv2.cvtColor(
+        cv2.merge((l, a, b)),
+        cv2.COLOR_LAB2RGB
+    )
+
+    return img.astype(np.float32) / 255.0
+
+
+def preprocess_tf(path):
+    img = tf.py_function(
+        preprocess_np,
+        [path],
+        tf.float32
+    )
+    img.set_shape([IMG_SIZE, IMG_SIZE, 3])
     return img
 
-def make_dataset(paths: np.ndarray, y: np.ndarray, img_size: int, batch_size: int) -> tf.data.Dataset:
-    ds = tf.data.Dataset.from_tensor_slices((paths, y))
 
-    def _map_fn(x, label):
-        img = decode_image(x, img_size)
-        return img, tf.cast(label, tf.float32)
-
-    ds = ds.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return ds
+def make_dataset(paths):
+    ds = tf.data.Dataset.from_tensor_slices(paths)
+    ds = ds.map(
+        preprocess_tf,
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
 
-# -----------------------------
-# Load val split (match training logic)
-# -----------------------------
-def build_val_from_resolved_cfg(cfg: dict) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    classes = cfg["classes"]
-    df = pd.read_csv(cfg["csv_path"])
-    df.columns = [c.strip() for c in df.columns]
+# =========================================================
+# BUILD SAME VALIDATION SET AS train_V7.py
+# =========================================================
+def build_val(csv_path, image_root):
 
-    img_root = Path(cfg["img_root"])
-    img_map = list_images_recursive(img_root)
+    print("\n[1] Loading dataset...")
 
-    df["Image Index"] = df["Image Index"].astype(str).str.strip()
-    df["path"] = df["Image Index"].map(img_map.get)
+    df = pd.read_csv(csv_path)
+    image_map = find_images(image_root)
 
-    miss = df["path"].isna()
-    if miss.any():
-        alt = df.loc[miss, "Image Index"].str.replace(".png", ".jpg", regex=False)
-        df.loc[miss, "path"] = alt.map(img_map.get)
+    print(f"Images found: {len(image_map)}")
 
-    miss = df["path"].isna()
-    if miss.any():
-        alt = df.loc[miss, "Image Index"].str.replace(".jpg", ".png", regex=False)
-        df.loc[miss, "path"] = alt.map(img_map.get)
+    df["filepath"] = df["Image Index"].map(image_map)
 
-    df = df[df["path"].notna()].reset_index(drop=True)
+    df = df[df["filepath"].notna()].copy()
 
-    # train_list filter (เหมือน train.py)
-    train_list = cfg.get("train_list", None)
-    if train_list and Path(train_list).exists():
-        train_names = set(load_list_file(train_list))
-        df_train = df[df["Image Index"].isin(train_names)].copy()
-    else:
-        df_train = df.copy()
-
-    # ทำให้ split stable มากขึ้น
-    df_train = df_train.sort_values("Image Index").reset_index(drop=True)
-
-    train_df, val_df = train_test_split(
-        df_train,
-        test_size=float(cfg.get("val_size", 0.2)),
-        random_state=int(cfg.get("seed", 42)),
-        shuffle=True,
+    # PA / AP only
+    df["View Position"] = (
+        df["View Position"]
+        .astype(str)
+        .str.strip()
     )
 
-    X_val = val_df["path"].values.astype(str)
-    y_val = np.stack([labels_to_multihot(x, classes) for x in val_df["Finding Labels"].tolist()], axis=0)
-    return X_val, y_val, classes
+    df = df[
+        df["View Position"].isin(["PA", "AP"])
+    ].copy()
 
+    # 6 labels
+    labels = df["Finding Labels"].fillna("").str.split("|")
 
-# -----------------------------
-# Plot model graph (requires graphviz+pydot)
-# -----------------------------
-def try_plot_model_png(model: keras.Model, out_png: Path):
-    try:
-        keras.utils.plot_model(model, to_file=str(out_png), show_shapes=True, expand_nested=True, dpi=120)
-        return True
-    except Exception as e:
-        print(f"[WARN] plot_model failed for {out_png.name}: {e}")
-        return False
+    for cls in CLASSES:
+        df[cls] = labels.apply(
+            lambda x: int(cls in x)
+        )
 
+    # Positive 6 findings
+    positive = df[
+        df[CLASSES].sum(axis=1) > 0
+    ].copy()
 
-# -----------------------------
-# Plot training history
-# -----------------------------
-def plot_history(history_csv: Path, out_png: Path):
-    if not history_csv.exists():
-        print("[WARN] history.csv not found:", history_csv)
-        return
+    # No Finding max 5000
+    negative = df[
+        df["Finding Labels"].eq("No Finding")
+    ].copy()
 
-    dfh = pd.read_csv(history_csv)
-    # plot whatever exists: acc/val_acc/auc/val_auc/loss/val_loss
-    cols = dfh.columns.tolist()
-
-    plt.figure()
-    if "acc" in cols: plt.plot(dfh["acc"], label="acc")
-    if "val_acc" in cols: plt.plot(dfh["val_acc"], label="val_acc")
-    if "auc" in cols: plt.plot(dfh["auc"], label="auc")
-    if "val_auc" in cols: plt.plot(dfh["val_auc"], label="val_auc")
-    if "loss" in cols: plt.plot(dfh["loss"], label="loss")
-    if "val_loss" in cols: plt.plot(dfh["val_loss"], label="val_loss")
-    plt.title("Training History")
-    plt.xlabel("epoch")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=200)
-    plt.close()
-
-
-# -----------------------------
-# Evaluate (acc + auc) on val
-# -----------------------------
-def evaluate_model_on_val(model_path: Path, cfg: dict) -> dict:
-    model = keras.models.load_model(str(model_path), compile=False)
-
-    X_val, y_val, classes = build_val_from_resolved_cfg(cfg)
-    val_ds = make_dataset(X_val, y_val, int(cfg["img_size"]), int(cfg["batch_size"]))
-
-    # compile for metrics only (loss can be generic)
-    model.compile(
-        optimizer="adam",
-        loss="binary_crossentropy",
-        metrics=[
-            keras.metrics.BinaryAccuracy(name="acc"),
-            keras.metrics.AUC(name="auc", multi_label=True, num_labels=len(classes)),
-        ]
+    negative = negative.sample(
+        n=min(N_NO_FINDING, len(negative)),
+        random_state=SEED
     )
 
-    results = model.evaluate(val_ds, verbose=1)
-    names = model.metrics_names  # includes 'loss', 'acc', 'auc'
-    out = {names[i]: float(results[i]) for i in range(len(names))}
-    out["n_val"] = int(len(X_val))
-    return out
+    selected = pd.concat(
+        [positive, negative],
+        ignore_index=True
+    ).sample(
+        frac=1,
+        random_state=SEED
+    ).reset_index(drop=True)
 
+    # Patient-level split
+    patients = selected["Patient ID"].unique()
 
-def main():
-    # ✅ ใส่ชื่อโฟลเดอร์ run ของทั้งสามโมเดลตรงนี้
-    # ถ้ายังมีแค่ baseline_run ก็ใส่อันเดียวก่อน แล้วค่อยเพิ่มอีกสองอัน
-    run_names = [
-        # "densenet_run",
-        # "resnet_run",
-        # "mobilenet_run",
-        "baseline_run",
+    train_patients, val_patients = train_test_split(
+        patients,
+        test_size=0.2,
+        random_state=SEED
+    )
+
+    train_df = selected[
+        selected["Patient ID"].isin(train_patients)
     ]
 
-    runs_root = project_root() / "runs"
-    report_rows = []
+    val_df = selected[
+        selected["Patient ID"].isin(val_patients)
+    ].copy().reset_index(drop=True)
 
-    for rn in run_names:
-        run_dir = runs_root / rn
-        cfg_path = run_dir / "resolved_config.json"
-        best_path = run_dir / "best.keras"
-        hist_path = run_dir / "history.csv"
+    overlap = (
+        set(train_df["Patient ID"])
+        & set(val_df["Patient ID"])
+    )
 
-        if not run_dir.exists():
-            print("[SKIP] missing run_dir:", run_dir)
-            continue
-        if not cfg_path.exists() or not best_path.exists():
-            print("[SKIP] missing cfg/model in:", run_dir)
-            continue
+    assert len(overlap) == 0
 
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    print(f"Selected   : {len(selected)}")
+    print(f"Train      : {len(train_df)}")
+    print(f"Validation : {len(val_df)}")
+    print(f"Overlap    : {len(overlap)}")
 
-        out_dir = run_dir / "evaluation_outputs"
-        ensure_dir(out_dir)
+    print("\nValidation View Position:")
+    print(val_df["View Position"].value_counts())
 
-        # 1) plot model graph
-        model = keras.models.load_model(str(best_path), compile=False)
-        ok = try_plot_model_png(model, out_dir / "model_graph.png")
-        if ok:
-            print("[OK] saved model graph:", out_dir / "model_graph.png")
+    return val_df
+
+
+def safe_auc(y_true, y_score):
+    if len(np.unique(y_true)) < 2:
+        return np.nan
+    return roc_auc_score(y_true, y_score)
+
+
+def class_metrics(y_true, y_score):
+    y_pred = (y_score >= THRESHOLD).astype(int)
+
+    return {
+        "AUC": safe_auc(y_true, y_score),
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Precision": precision_score(
+            y_true, y_pred, zero_division=0
+        ),
+        "Recall": recall_score(
+            y_true, y_pred, zero_division=0
+        ),
+        "F1": f1_score(
+            y_true, y_pred, zero_division=0
+        ),
+        "Positive": int(y_true.sum()),
+        "Negative": int(len(y_true) - y_true.sum())
+    }
+
+
+# =========================================================
+# EVALUATION
+# =========================================================
+def evaluate(model_path, val_df, out_dir):
+
+    print("\n[2] Loading DenseNet121...")
+
+    model = keras.models.load_model(
+        model_path,
+        compile=False
+    )
+
+    x = val_df["filepath"].values.astype(str)
+    y_true = val_df[CLASSES].values.astype(int)
+
+    print("\n[3] Predicting validation set...")
+
+    y_score = model.predict(
+        make_dataset(x),
+        verbose=1
+    )[:len(y_true)]
+
+    y_pred = (y_score >= THRESHOLD).astype(int)
+
+    # ---------------- Overall ----------------
+    aucs = [
+        safe_auc(y_true[:, i], y_score[:, i])
+        for i in range(len(CLASSES))
+    ]
+
+    overall = {
+        "Model": "DenseNet121",
+        "Validation Images": len(y_true),
+        "Threshold": THRESHOLD,
+        "Accuracy": float(np.mean(y_true == y_pred)),
+        "Precision Micro": precision_score(
+            y_true, y_pred,
+            average="micro",
+            zero_division=0
+        ),
+        "Recall Micro": recall_score(
+            y_true, y_pred,
+            average="micro",
+            zero_division=0
+        ),
+        "F1 Micro": f1_score(
+            y_true, y_pred,
+            average="micro",
+            zero_division=0
+        ),
+        "Precision Macro": precision_score(
+            y_true, y_pred,
+            average="macro",
+            zero_division=0
+        ),
+        "Recall Macro": recall_score(
+            y_true, y_pred,
+            average="macro",
+            zero_division=0
+        ),
+        "F1 Macro": f1_score(
+            y_true, y_pred,
+            average="macro",
+            zero_division=0
+        ),
+        "Macro AUC": float(np.nanmean(aucs))
+    }
+
+    print("\n" + "=" * 65)
+    print("DENSENET121 OVERALL RESULTS")
+    print("=" * 65)
+
+    for k, v in overall.items():
+        if isinstance(v, float):
+            print(f"{k:20}: {v:.4f}")
         else:
-            # fallback: save model summary to txt
-            summary_txt = out_dir / "model_summary.txt"
-            with open(summary_txt, "w", encoding="utf-8") as f:
-                model.summary(print_fn=lambda s: f.write(s + "\n"))
-            print("[OK] saved model summary:", summary_txt)
+            print(f"{k:20}: {v}")
 
-        # 2) plot history
-        plot_history(hist_path, out_dir / "history_plot.png")
-        print("[OK] saved history plot:", out_dir / "history_plot.png")
+    # ---------------- PA / AP ----------------
+    rows = []
 
-        # 3) evaluate acc/auc
-        metrics = evaluate_model_on_val(best_path, cfg)
-        metrics["run_name"] = rn
-        metrics["backbone"] = cfg.get("backbone", "unknown")
-        report_rows.append(metrics)
+    for view in ["PA", "AP"]:
 
-        # save per-run json
-        with open(out_dir / "val_metrics.json", "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2, ensure_ascii=False)
-        print("[OK] saved metrics:", out_dir / "val_metrics.json")
+        mask = val_df["View Position"].values == view
+        yt = y_true[mask]
+        ys = y_score[mask]
 
-    # summary csv
-    if report_rows:
-        df = pd.DataFrame(report_rows)
-        out_csv = runs_root / "ALL_RUNS_val_metrics.csv"
-        df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-        print("[OK] wrote:", out_csv)
-        print(df)
-    else:
-        print("No runs evaluated. Check run_names and file structure.")
+        print("\n" + "=" * 80)
+        print(f"{view} - 6 FINDINGS | Images = {len(yt)}")
+        print("=" * 80)
+        print(
+            f"{'Disease':15} {'AUC':>8} {'ACC':>8} "
+            f"{'Precision':>10} {'Recall':>8} {'F1':>8}"
+        )
+        print("-" * 80)
+
+        for i, disease in enumerate(CLASSES):
+
+            m = class_metrics(
+                yt[:, i],
+                ys[:, i]
+            )
+
+            rows.append({
+                "Disease": disease,
+                "View": view,
+                "N": len(yt),
+                **m
+            })
+
+            print(
+                f"{disease:15} "
+                f"{m['AUC']:8.4f} "
+                f"{m['Accuracy']:8.4f} "
+                f"{m['Precision']:10.4f} "
+                f"{m['Recall']:8.4f} "
+                f"{m['F1']:8.4f}"
+            )
+
+    # ---------------- Save ----------------
+    result_df = pd.DataFrame(rows)
+
+    with open(
+        out_dir / "DenseNet121_Overall.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            overall,
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    result_df.to_csv(
+        out_dir / "DenseNet121_AP_PA.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    result_df[
+        result_df["View"] == "PA"
+    ].to_csv(
+        out_dir / "DenseNet121_PA.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    result_df[
+        result_df["View"] == "AP"
+    ].to_csv(
+        out_dir / "DenseNet121_AP.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    print("\n[OK] Results saved to:")
+    print(out_dir)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+
+    r = root()
+
+    model_path = (
+        r / "models_v7"
+        / "best_DenseNet121_v7.keras"
+    )
+
+    csv_path = (
+        r / "archive"
+        / "Data_Entry_2017.csv"
+    )
+
+    image_root = r / "archive"
+
+    out_dir = (
+        r / "outputs"
+        / "evaluation_v7"
+        / "DenseNet121"
+    )
+
+    out_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    if not model_path.exists():
+        raise FileNotFoundError(model_path)
+
+    if not csv_path.exists():
+        raise FileNotFoundError(csv_path)
+
+    print("=" * 65)
+    print("PBN CHEST X-RAY - DENSENET121 EVALUATION")
+    print("=" * 65)
+
+    val_df = build_val(
+        csv_path,
+        image_root
+    )
+
+    val_df.to_csv(
+        out_dir / "validation_cases.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    evaluate(
+        model_path,
+        val_df,
+        out_dir
+    )
 
 
 if __name__ == "__main__":

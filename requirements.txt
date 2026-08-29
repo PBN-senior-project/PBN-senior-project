@@ -8,3 +8,4 @@ pillow
 opencv-python-headless
 requests
 prometheus-client
+streamlit

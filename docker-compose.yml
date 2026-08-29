@@ -6,7 +6,8 @@ services:
     volumes:
       - ./src:/app/src
       # - ${ARCHIVE_HOST_PATH}:/app/archive
-      - D:/senior-project/ploy-senior-project/archive:/archive
+      - ./archive:/app/archive
+      - ./archive:/archive
       - ./outputs:/app/outputs
       - ./models_v7:/app/models_v7
 

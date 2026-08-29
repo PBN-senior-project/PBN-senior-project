@@ -4,6 +4,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import tensorflow as tf
+import os, glob, cv2
+import time
+import numpy as np
 
 from tensorflow.keras import layers, models, optimizers, callbacks, mixed_precision
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -558,7 +561,10 @@ for name in MODEL_NAMES:
     monitor_cb = PrometheusTrainingCallback(
         model_name=name,
         total_images=len(train_df),
-        batch_size=BATCH_SIZE
+        batch_size=BATCH_SIZE,
+        total_epochs=EPOCHS,
+        total_batches=len(train_generator),
+        val_batches=len(val_generator)
     )
 
     path = os.path.join(

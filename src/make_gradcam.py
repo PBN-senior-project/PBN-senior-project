@@ -1,7 +1,6 @@
-import json
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
 
+import cv2
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -10,180 +9,374 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 
 
-def project_root() -> Path:
+CLASSES = [
+    "Infiltration",
+    "Effusion",
+    "Atelectasis",
+    "Nodule",
+    "Mass",
+    "Pneumothorax",
+]
+
+IMG_SIZE = 384
+SEED = 42
+N_NO_FINDING = 5000
+
+
+def root():
     return Path(__file__).resolve().parents[1]
 
-def ensure_dir(path: Path):
-    path.mkdir(parents=True, exist_ok=True)
 
-def list_images_recursive(root_dir: Path, exts=(".png", ".jpg", ".jpeg")) -> Dict[str, str]:
-    mapping = {}
-    for fp in root_dir.rglob("*"):
-        if fp.is_file() and fp.suffix.lower() in exts:
-            mapping[fp.name] = str(fp.resolve())
-    return mapping
+def find_images(folder):
+    return {
+        p.name: str(p.resolve())
+        for p in folder.rglob("*.png")
+    }
 
-def load_list_file(list_path: str) -> List[str]:
-    lines = []
-    with open(list_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                lines.append(Path(line).name)
-    return lines
 
-def labels_to_multihot(finding_labels: str, classes: List[str]) -> np.ndarray:
-    s = str(finding_labels) if finding_labels is not None else ""
-    parts = [x.strip() for x in s.split("|") if x.strip()]
-    parts_set = set(parts)
-    y = np.zeros((len(classes),), dtype=np.float32)
-    for i, c in enumerate(classes):
-        if c in parts_set:
-            y[i] = 1.0
-    return y
+def apply_clahe(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
 
-def load_and_preprocess_image(path: str, img_size: int) -> Tuple[np.ndarray, np.ndarray]:
-    raw = tf.io.read_file(path)
-    img = tf.image.decode_image(raw, channels=3, expand_animations=False)
-    img = tf.image.convert_image_dtype(img, tf.float32)  # [0,1]
-    img_resized = tf.image.resize(img, (img_size, img_size), antialias=True)
-    return img.numpy(), img_resized.numpy()
+    l = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    ).apply(l)
 
-def build_val_df(cfg: dict) -> Tuple[pd.DataFrame, List[str]]:
-    classes = cfg["classes"]
-    df = pd.read_csv(cfg["csv_path"])
-    df.columns = [c.strip() for c in df.columns]
-
-    img_root = Path(cfg["img_root"])
-    img_map = list_images_recursive(img_root)
-
-    df["Image Index"] = df["Image Index"].astype(str).str.strip()
-    df["path"] = df["Image Index"].map(img_map.get)
-
-    miss = df["path"].isna()
-    if miss.any():
-        alt = df.loc[miss, "Image Index"].str.replace(".png", ".jpg", regex=False)
-        df.loc[miss, "path"] = alt.map(img_map.get)
-
-    miss = df["path"].isna()
-    if miss.any():
-        alt = df.loc[miss, "Image Index"].str.replace(".jpg", ".png", regex=False)
-        df.loc[miss, "path"] = alt.map(img_map.get)
-
-    df = df[df["path"].notna()].reset_index(drop=True)
-
-    train_list = cfg.get("train_list", None)
-    if train_list and Path(train_list).exists():
-        train_names = set(load_list_file(train_list))
-        df_train = df[df["Image Index"].isin(train_names)].copy()
-    else:
-        df_train = df.copy()
-
-    df_train = df_train.sort_values("Image Index").reset_index(drop=True)
-
-    train_df, val_df = train_test_split(
-        df_train,
-        test_size=float(cfg.get("val_size", 0.2)),
-        random_state=int(cfg.get("seed", 42)),
-        shuffle=True,
+    return cv2.cvtColor(
+        cv2.merge((l, a, b)),
+        cv2.COLOR_LAB2RGB
     )
 
-    return val_df.reset_index(drop=True), classes
 
-def find_last_conv_layer_name(model: keras.Model) -> str:
-    # หา Conv2D ตัวสุดท้ายแบบอัตโนมัติ (ใช้ได้กับ DenseNet/ResNet/MobileNet ส่วนใหญ่)
+def load_image(path):
+    img = cv2.imread(str(path))
+
+    if img is None:
+        raise ValueError(f"Cannot read image: {path}")
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # original image for display
+    original = img.astype(np.float32) / 255.0
+
+    # same validation preprocessing as train_V7.py
+    processed = cv2.resize(
+        img,
+        (IMG_SIZE, IMG_SIZE)
+    )
+
+    processed = apply_clahe(processed)
+    processed = processed.astype(np.float32) / 255.0
+
+    return original, processed
+
+
+def build_validation(csv_path, img_root):
+    print("[1] Building validation set...")
+
+    df = pd.read_csv(csv_path)
+    img_map = find_images(img_root)
+
+    df["filepath"] = df["Image Index"].map(img_map)
+    df = df[df["filepath"].notna()].copy()
+
+    # PA/AP only
+    df["View Position"] = (
+        df["View Position"]
+        .astype(str)
+        .str.strip()
+    )
+
+    df = df[
+        df["View Position"].isin(["PA", "AP"])
+    ].copy()
+
+    # labels
+    labels = df["Finding Labels"].fillna("").str.split("|")
+
+    for cls in CLASSES:
+        df[cls] = labels.apply(
+            lambda x: int(cls in x)
+        )
+
+    # positive 6 findings
+    positive = df[
+        df[CLASSES].sum(axis=1) > 0
+    ].copy()
+
+    # No Finding max 5000
+    negative = df[
+        df["Finding Labels"].eq("No Finding")
+    ].copy()
+
+    negative = negative.sample(
+        n=min(N_NO_FINDING, len(negative)),
+        random_state=SEED
+    )
+
+    selected = pd.concat(
+        [positive, negative],
+        ignore_index=True
+    ).sample(
+        frac=1,
+        random_state=SEED
+    ).reset_index(drop=True)
+
+    # patient-level split
+    patients = selected["Patient ID"].unique()
+
+    train_patients, val_patients = train_test_split(
+        patients,
+        test_size=0.2,
+        random_state=SEED
+    )
+
+    val_df = selected[
+        selected["Patient ID"].isin(val_patients)
+    ].copy().reset_index(drop=True)
+
+    print(f"Selected   : {len(selected)}")
+    print(f"Validation : {len(val_df)}")
+    print(val_df["View Position"].value_counts())
+
+    return val_df
+
+
+def find_last_conv(model):
     for layer in reversed(model.layers):
         if isinstance(layer, keras.layers.Conv2D):
             return layer.name
-    # กรณีเป็น nested model (applications) อาจซ่อนอยู่ข้างใน
+
     for layer in reversed(model.layers):
         if isinstance(layer, keras.Model):
             for sub in reversed(layer.layers):
                 if isinstance(sub, keras.layers.Conv2D):
                     return sub.name
-    raise ValueError("Cannot find a Conv2D layer for Grad-CAM.")
 
-def gradcam_heatmap(model: keras.Model, img_batch: tf.Tensor, class_index: int, conv_layer_name: str) -> np.ndarray:
-    conv_layer = model.get_layer(conv_layer_name)
-    grad_model = keras.Model([model.inputs], [conv_layer.output, model.output])
+    raise ValueError("Conv2D layer not found")
+
+
+def make_gradcam(model, image, class_idx, conv_name):
+    conv_layer = model.get_layer(conv_name)
+
+    grad_model = keras.Model(
+        model.inputs,
+        [conv_layer.output, model.output]
+    )
 
     with tf.GradientTape() as tape:
-        conv_out, preds = grad_model(img_batch, training=False)
-        # multi-label: ใช้คะแนนของคลาสนั้นโดยตรง
-        class_score = preds[:, class_index]
+        conv_out, pred = grad_model(
+            image,
+            training=False
+        )
 
-    grads = tape.gradient(class_score, conv_out)  # (1,H,W,C)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))  # (C,)
+        score = pred[:, class_idx]
 
-    conv_out = conv_out[0]  # (H,W,C)
-    heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)  # (H,W)
+    grads = tape.gradient(
+        score,
+        conv_out
+    )
 
-    heatmap = tf.maximum(heatmap, 0)  # ReLU
-    denom = tf.reduce_max(heatmap) + 1e-8
-    heatmap = heatmap / denom
+    weights = tf.reduce_mean(
+        grads,
+        axis=(0, 1, 2)
+    )
+
+    conv_out = conv_out[0]
+
+    heatmap = tf.reduce_sum(
+        conv_out * weights,
+        axis=-1
+    )
+
+    heatmap = tf.maximum(
+        heatmap,
+        0
+    )
+
+    heatmap /= (
+        tf.reduce_max(heatmap) + 1e-8
+    )
+
     return heatmap.numpy()
 
-def overlay_and_save(orig_img01: np.ndarray, heatmap: np.ndarray, out_path: Path, title: str):
-    # orig_img01: [H,W,3] in [0,1]
-    plt.figure()
-    plt.imshow(orig_img01)
-    plt.imshow(heatmap, alpha=0.35)  # overlay
-    plt.title(title)
-    plt.axis("off")
+
+def save_gradcam(
+    original,
+    heatmap,
+    path,
+    title
+):
+    heatmap = cv2.resize(
+        heatmap,
+        (
+            original.shape[1],
+            original.shape[0]
+        )
+    )
+
+    fig, ax = plt.subplots(
+        1,
+        2,
+        figsize=(10, 5)
+    )
+
+    ax[0].imshow(original, cmap="gray")
+    ax[0].set_title("Original X-ray")
+    ax[0].axis("off")
+
+    ax[1].imshow(original, cmap="gray")
+    ax[1].imshow(
+        heatmap,
+        cmap="jet",
+        alpha=0.40
+    )
+    ax[1].set_title(title)
+    ax[1].axis("off")
+
     plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
+    plt.savefig(
+        path,
+        dpi=200,
+        bbox_inches="tight"
+    )
     plt.close()
 
-def main(run_name="baseline_run", use_best=True, n_images=10, thr=0.5):
-    run_dir = project_root() / "runs" / run_name
-    cfg = json.loads((run_dir / "resolved_config.json").read_text(encoding="utf-8"))
-    classes = cfg["classes"]
-    img_size = int(cfg["img_size"])
 
-    model_path = run_dir / ("best.keras" if use_best else "final.keras")
-    model = keras.models.load_model(str(model_path), compile=False)
+def main():
+    r = root()
 
-    conv_name = find_last_conv_layer_name(model)
-    print("Using last conv layer for Grad-CAM:", conv_name)
+    model_path = (
+        r / "models_v7"
+        / "best_DenseNet121_v7.keras"
+    )
 
-    val_df, _ = build_val_df(cfg)
+    csv_path = (
+        r / "archive"
+        / "Data_Entry_2017.csv"
+    )
 
-    # สุ่มภาพ
-    val_df = val_df.sample(n=min(n_images, len(val_df)), random_state=cfg.get("seed", 42)).reset_index(drop=True)
+    img_root = r / "archive"
 
-    out_dir = run_dir / "gradcam_outputs"
-    ensure_dir(out_dir)
+    out_dir = (
+        r / "outputs"
+        / "gradcam_v7"
+        / "DenseNet121"
+    )
 
-    for i in range(len(val_df)):
-        img_path = val_df.loc[i, "path"]
-        img_index = val_df.loc[i, "Image Index"]
-        finding = str(val_df.loc[i, "Finding Labels"])
+    out_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-        orig01, resized01 = load_and_preprocess_image(img_path, img_size)  # orig01 may be different size
-        inp = tf.convert_to_tensor(resized01[None, ...], dtype=tf.float32)  # (1,img,img,3)
+    # ---------------------------------
+    # validation set
+    # ---------------------------------
+    val_df = build_validation(
+        csv_path,
+        img_root
+    )
 
-        preds = model.predict(inp, verbose=0)[0]  # (C,)
-        top_idx = int(np.argmax(preds))
-        top_score = float(preds[top_idx])
+    # ---------------------------------
+    # model
+    # ---------------------------------
+    print("\n[2] Loading DenseNet121...")
 
-        # ถ้าคะแนนต่ำมาก อาจไม่ชัด: คุณปรับ thr ได้
-        if top_score < thr:
-            # ก็ยังทำได้อยู่ แค่แจ้งไว้ในชื่อไฟล์
-            pass
+    model = keras.models.load_model(
+        model_path,
+        compile=False
+    )
 
-        heat = gradcam_heatmap(model, inp, top_idx, conv_name)
-        # resize heatmap ให้เท่ากับภาพต้นฉบับ
-        heat_tf = tf.image.resize(heat[..., None], (orig01.shape[0], orig01.shape[1]), antialias=True)
-        heat_resized = heat_tf.numpy().squeeze()
+    conv_name = find_last_conv(model)
 
-        title = f"{img_index} | top={classes[top_idx]}:{top_score:.3f} | labels={finding}"
-        out_path = out_dir / f"gradcam_{i:03d}_{classes[top_idx]}_{img_index}.png"
-        overlay_and_save(orig01, heat_resized, out_path, title)
-        print("[OK]", out_path)
+    print(
+        "Last Conv Layer:",
+        conv_name
+    )
 
-    print("Saved Grad-CAM overlays to:", out_dir)
+    # ---------------------------------
+    # one positive example per disease
+    # ---------------------------------
+    for disease in CLASSES:
+        cases = val_df[
+            val_df[disease] == 1
+        ]
+
+        if cases.empty:
+            print(
+                f"[SKIP] No validation case: "
+                f"{disease}"
+            )
+            continue
+
+        # reproducible sample
+        row = cases.sample(
+            1,
+            random_state=SEED
+        ).iloc[0]
+
+        original, processed = load_image(
+            row["filepath"]
+        )
+
+        inp = tf.convert_to_tensor(
+            processed[None, ...],
+            dtype=tf.float32
+        )
+
+        pred = model.predict(
+            inp,
+            verbose=0
+        )[0]
+
+        class_idx = CLASSES.index(
+            disease
+        )
+
+        score = float(
+            pred[class_idx]
+        )
+
+        heatmap = make_gradcam(
+            model,
+            inp,
+            class_idx,
+            conv_name
+        )
+
+        view = row["View Position"]
+        image_name = row["Image Index"]
+
+        title = (
+            f"{disease} | "
+            f"{view} | "
+            f"Score={score:.3f}"
+        )
+
+        out_path = (
+            out_dir
+            / f"GradCAM_{disease}_{view}_{image_name}.png"
+        )
+
+        save_gradcam(
+            original,
+            heatmap,
+            out_path,
+            title
+        )
+
+        print(
+            f"[OK] {disease:15} "
+            f"{view} "
+            f"score={score:.3f}"
+        )
+
+    print(
+        "\nSaved to:",
+        out_dir
+    )
 
 
 if __name__ == "__main__":
-    # ✅ เปลี่ยน run_name ให้ตรงกับของคุณ
-    main(run_name="baseline_run", use_best=True, n_images=10, thr=0.5)
+    main()

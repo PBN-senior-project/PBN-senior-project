@@ -4,15 +4,20 @@ run:
   out_dir: "../runs"
 
 data:
-  csv_path: "archive/Data_Entry_2017.csv"
-  img_root: "archive"
-  train_list: "archive/train_80_oversampled.txt"
-  test_list: "archive/test_20_fixed.txt"
+  csv_path: "/archive/Data_Entry_2017.csv"
+  img_root: "/archive"
+  train_list: "/archive/train_80_oversampled.txt"
+  test_list: "/archive/test_20_fixed.txt"
   img_size: 224
   batch_size: 16
 
 labels:
-  classes: ["Atelectasis", "Cardiomegaly", "Edema", "Emphysema", "Fibrosis"]
+  classes:
+    - "Atelectasis"
+    - "Cardiomegaly"
+    - "Edema"
+    - "Emphysema"
+    - "Fibrosis"
 
 model:
   backbone: "densenet121"
