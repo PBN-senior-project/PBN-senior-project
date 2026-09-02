@@ -9,3 +9,4 @@ opencv-python-headless
 requests
 prometheus-client
 streamlit
+iterative-stratification
