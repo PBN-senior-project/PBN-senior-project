@@ -1,176 +1,408 @@
-import os, time, requests
+import os
+import time
+import threading
+import requests
 from datetime import datetime
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PROM = "http://prometheus:9090"
 BASE = f"https://api.telegram.org/bot{TOKEN}"
 
+# ถ้ามีหลายคน ให้ใส่ TELEGRAM_CHAT_IDS=123456,789012
+ENV_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS", "")
+
+SUBSCRIBERS = {
+    int(x.strip())
+    for x in ENV_CHAT_IDS.split(",")
+    if x.strip()
+}
+
+CHECK_INTERVAL = 10
+
+last_epoch = None
+last_model = None
+
+
+# =========================================================
+# PROMETHEUS
+# =========================================================
 def query(metric):
     try:
-        x = requests.get(f"{PROM}/api/v1/query",
-            params={"query": metric}, timeout=10).json()["data"]["result"]
-        return (float(x[0]["value"][1]), x[0].get("metric", {})) if x else (None, {})
-    except Exception:
+        r = requests.get(
+            f"{PROM}/api/v1/query",
+            params={"query": metric},
+            timeout=10
+        )
+        r.raise_for_status()
+
+        x = r.json()["data"]["result"]
+
+        if not x:
+            return None, {}
+
+        return float(x[0]["value"][1]), x[0].get("metric", {})
+
+    except Exception as e:
+        print("Prometheus error:", e)
         return None, {}
 
+
+# =========================================================
+# TELEGRAM
+# =========================================================
 def send(chat, text):
     try:
-        requests.post(f"{BASE}/sendMessage",
-            json={"chat_id": chat, "text": text}, timeout=10)
+        r = requests.post(
+            f"{BASE}/sendMessage",
+            json={
+                "chat_id": chat,
+                "text": text
+            },
+            timeout=10
+        )
+        r.raise_for_status()
+
     except Exception as e:
-        print("Telegram error:", e)
+        print("Telegram send error:", e)
 
-def duration(s):
-    if s is None: return "-"
-    s = max(0, int(s))
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
 
-def date(ts):
-    return datetime.fromtimestamp(ts).strftime("%d %b %Y %H:%M") if ts else "-"
+def broadcast(text):
+    """ส่งข้อความให้ทุกคนที่ subscribe"""
+    for chat in list(SUBSCRIBERS):
+        send(chat, text)
 
+
+# =========================================================
+# GET TRAINING VALUES
+# =========================================================
 def get_values():
+
     names = [
-        "training_status", "training_epoch", "training_total_epochs",
-        "training_batch", "training_total_batches",
-        "training_images_processed", "training_total_images",
-        "training_progress_percent", "training_loss", "training_auc",
-        "validation_loss", "validation_auc",
-        "training_seconds_per_step", "training_epoch_elapsed_seconds",
-        "training_train_remaining_seconds",
-        "training_validation_estimate_seconds",
-        "training_next_epoch_eta_timestamp",
-        "training_model_elapsed_seconds",
-        "training_model_remaining_seconds",
-        "training_model_finish_timestamp",
-        "training_last_update_timestamp"
+        "training_status",
+        "training_epoch",
+        "training_total_epochs",
+        "training_batch",
+        "training_total_batches",
+        "training_progress_percent",
+        "training_loss",
+        "training_auc",
     ]
-    v = {n: query(n)[0] for n in names}
+
+    values = {}
+
+    for name in names:
+        values[name] = query(name)[0]
+
+    # ดึง model จาก label ของ training_epoch
     _, labels = query("training_epoch")
-    return v, labels.get("model", "Unknown")
 
-def health(v):
-    epoch, va = v["training_epoch"], v["validation_auc"]
-    if epoch and epoch <= 2:
-        return "🟡 Model Health: EARLY TRAINING\nยังเร็วเกินไปที่จะสรุป"
-    if va is None:
-        return "🟡 Model Health: MONITORING"
-    if va < .55: return "🔴 Model Health: POOR"
-    if va < .70: return "🟠 Model Health: WARNING"
-    if va >= .80: return "🟢 Model Health: GOOD"
-    return "🟡 Model Health: ACCEPTABLE"
+    model = labels.get("model", "Unknown")
 
+    return values, model
+
+
+# =========================================================
+# FORMAT VALUE
+# =========================================================
+def value_or_dash(value, decimals=4):
+
+    if value is None:
+        return "-"
+
+    return f"{value:.{decimals}f}"
+
+
+# =========================================================
+# STATUS
+# =========================================================
 def get_status():
+
     v, model = get_values()
+
     if v["training_epoch"] is None:
         return "⚪ ยังไม่พบ Training Metrics"
 
-    status = {1: "🟢 TRAINING", 2: "🔵 VALIDATING", 3: "✅ COMPLETED"}
+    status_map = {
+        1: "🟢 TRAINING",
+        2: "🔵 VALIDATING",
+        3: "✅ COMPLETED"
+    }
+
+    status = status_map.get(
+        int(v["training_status"] or 0),
+        "⚪ UNKNOWN"
+    )
+
+    epoch = int(v["training_epoch"])
+    total_epochs = int(v["training_total_epochs"] or 0)
+
+    batch = int(v["training_batch"] or 0)
+    total_batches = int(v["training_total_batches"] or 0)
+
+    progress = v["training_progress_percent"]
+
     return (
-        "🧠 PBN Chest X-ray Training\n\n"
-        f"Status: {status.get(int(v['training_status'] or 0), '⚪ UNKNOWN')}\n"
+        "🧠 PLOY Chest X-ray Training\n\n"
+
+        f"Status: {status}\n"
         f"Model: {model}\n"
-        f"Epoch: {int(v['training_epoch'])} / {int(v['training_total_epochs'] or 0)}\n"
-        f"Batch: {int(v['training_batch'] or 0):,} / {int(v['training_total_batches'] or 0):,}\n"
-        f"Progress: {(v['training_progress_percent'] or 0):.2f}%\n\n"
-        f"Loss: {(v['training_loss'] or 0):.4f}\n"
-        f"AUC: {(v['training_auc'] or 0):.4f}"
+        f"Epoch: {epoch} / {total_epochs}\n"
+        f"Batch: {batch:,} / {total_batches:,}\n"
+        f"Progress: {value_or_dash(progress, 2)}%\n\n"
+
+        f"Loss: {value_or_dash(v['training_loss'])}\n"
+        f"AUC: {value_or_dash(v['training_auc'])}"
     )
 
-def get_report():
-    v, model = get_values()
-    if v["training_epoch"] is None:
-        return "⚪ ยังไม่พบ Training Metrics"
 
-    e = int(v["training_epoch"])
-    total_e = int(v["training_total_epochs"] or 0)
-    status = {1: "🟢 TRAINING", 2: "🔵 VALIDATING", 3: "✅ COMPLETED"}
+# =========================================================
+# NEW MODEL NOTIFICATION
+# =========================================================
+def model_notification(model, epoch, total_epochs):
 
-    text = (
-        "🧠 PBN Chest X-ray Training\n\n"
-        f"Status: {status.get(int(v['training_status'] or 0), '⚪ UNKNOWN')}\n"
-        f"Model: {model}\n\n"
+    return (
+        "🚀 NEW MODEL STARTED\n\n"
 
-        f"Epoch: {e} / {total_e}\n"
-        f"Batch: {int(v['training_batch'] or 0):,} / "
-        f"{int(v['training_total_batches'] or 0):,}\n"
-        f"Images: {int(v['training_images_processed'] or 0):,} / "
-        f"{int(v['training_total_images'] or 0):,}\n"
-        f"Epoch Progress: {(v['training_progress_percent'] or 0):.2f}%\n\n"
+        "🧠 PLOY Chest X-ray Training\n\n"
 
-        f"⏱ Epoch elapsed: {duration(v['training_epoch_elapsed_seconds'])}\n"
-        f"⏳ Train remaining: ~{duration(v['training_train_remaining_seconds'])}\n"
-        f"🔍 Estimated validation: ~{duration(v['training_validation_estimate_seconds'])}\n"
+        f"Model: {model}\n"
+        f"Epoch: {epoch} / {total_epochs}\n\n"
+
+        "✅ เริ่ม Training โมเดลใหม่แล้ว"
     )
 
-    if e < total_e:
-        text += (
-            f"➡️ Epoch {e + 1} expected start:\n"
-            f"   ~{date(v['training_next_epoch_eta_timestamp'])}\n"
+
+# =========================================================
+# NEW EPOCH NOTIFICATION
+# =========================================================
+def epoch_notification(model, epoch, total_epochs):
+
+    return (
+        "🔔 NEW EPOCH\n\n"
+
+        "🧠 PLOY Chest X-ray Training\n\n"
+
+        f"Model: {model}\n"
+        f"Epoch: {epoch} / {total_epochs}\n\n"
+
+        f"▶️ เริ่ม Epoch {epoch} แล้ว"
+    )
+
+
+# =========================================================
+# AUTO MONITOR
+# =========================================================
+def monitor_training():
+
+    global last_epoch, last_model
+
+    print("📡 Training monitor started")
+
+    while True:
+
+        try:
+
+            epoch_value, labels = query("training_epoch")
+            total_epochs, _ = query("training_total_epochs")
+
+            if epoch_value is None:
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            epoch = int(epoch_value)
+            total_epochs = int(total_epochs or 0)
+
+            model = labels.get("model", "Unknown")
+
+            # -----------------------------------------
+            # NEW MODEL
+            # -----------------------------------------
+            if last_model is None:
+
+                last_model = model
+
+                broadcast(
+                    model_notification(
+                        model,
+                        epoch,
+                        total_epochs
+                    )
+                )
+
+            elif model != last_model:
+
+                print(
+                    f"🚀 New model: "
+                    f"{last_model} -> {model}"
+                )
+
+                last_model = model
+
+                broadcast(
+                    model_notification(
+                        model,
+                        epoch,
+                        total_epochs
+                    )
+                )
+
+                # reset epoch เมื่อเปลี่ยน model
+                last_epoch = None
+
+            # -----------------------------------------
+            # NEW EPOCH
+            # -----------------------------------------
+            if last_epoch is None:
+
+                last_epoch = epoch
+
+                broadcast(
+                    epoch_notification(
+                        model,
+                        epoch,
+                        total_epochs
+                    )
+                )
+
+            elif epoch != last_epoch:
+
+                print(
+                    f"🔔 New epoch: "
+                    f"{last_epoch} -> {epoch}"
+                )
+
+                last_epoch = epoch
+
+                broadcast(
+                    epoch_notification(
+                        model,
+                        epoch,
+                        total_epochs
+                    )
+                )
+
+        except Exception as e:
+
+            print("Monitor error:", e)
+
+        time.sleep(CHECK_INTERVAL)
+
+
+# =========================================================
+# TELEGRAM COMMAND
+# =========================================================
+def handle(msg):
+
+    chat = msg["chat"]["id"]
+
+    text = msg.get("text", "").strip()
+
+    cmd = text.split()[0].split("@")[0] if text else ""
+
+    # เมื่อมีคนคุยกับ Bot
+    # ให้รับ notification อัตโนมัติ
+    SUBSCRIBERS.add(chat)
+
+    if cmd == "/start":
+
+        send(
+            chat,
+            "✅ PLOY Chest X-ray Monitor Started\n\n"
+            "คุณจะได้รับแจ้งเตือนอัตโนมัติเมื่อ:\n"
+            "🚀 เริ่ม Model ใหม่\n"
+            "🔔 ขึ้น Epoch ใหม่\n\n"
+            "ใช้ /status เพื่อดูสถานะ Training"
         )
 
-    text += (
-        f"\n⏱ Model elapsed: {duration(v['training_model_elapsed_seconds'])}\n"
-        f"⏳ Model remaining: ~{duration(v['training_model_remaining_seconds'])}\n"
-        f"🏁 {model} expected finish:\n"
-        f"   ~{date(v['training_model_finish_timestamp'])}\n\n"
+    elif cmd in ("/status", "/statust"):
 
-        f"⚡ Speed: {(v['training_seconds_per_step'] or 0):.2f} sec/step\n\n"
+        send(
+            chat,
+            get_status()
+        )
 
-        "📊 Metrics\n"
-        f"Loss: {(v['training_loss'] or 0):.4f}\n"
-        f"Train AUC: {(v['training_auc'] or 0):.4f}\n"
-    )
-
-    if v["validation_loss"] is not None:
-        text += f"Val Loss: {v['validation_loss']:.4f}\n"
-    if v["validation_auc"] is not None:
-        text += f"Val AUC: {v['validation_auc']:.4f}\n"
-
-    text += (
-        f"\n{health(v)}\n\n"
-        f"Last update: "
-        f"{duration(time.time() - v['training_last_update_timestamp'])} ago"
-        if v["training_last_update_timestamp"] else ""
-    )
-
-    return text
-
-def handle(msg):
-    chat, cmd = msg["chat"]["id"], msg.get("text", "").strip().split("@")[0]
-
-    if cmd == "/status": send(chat, get_status())
-    elif cmd in ("/report", "/metrics"): send(chat, get_report())
     elif cmd == "/help":
-        send(chat,
-            "📋 Commands\n\n"
-            "/status - สถานะแบบย่อ\n"
-            "/report - รายงาน Training แบบละเอียด\n"
-            "/metrics - รายงานแบบละเอียด\n"
-            "/help - ดูคำสั่ง")
-    else:
-        send(chat, "ใช้ /status หรือ /report")
 
-def main():
-    print("🤖 Telegram monitoring bot started")
+        send(
+            chat,
+            "📋 Commands\n\n"
+            "/status - ดูสถานะ Training\n"
+            "/help - ดูคำสั่ง"
+        )
+
+    else:
+
+        send(
+            chat,
+            "ใช้ /status เพื่อดูสถานะ Training"
+        )
+
+
+# =========================================================
+# TELEGRAM BOT
+# =========================================================
+def telegram_bot():
+
+    print("🤖 Telegram bot started")
+
     offset = None
 
     while True:
+
         try:
-            p = {"timeout": 30}
-            if offset is not None: p["offset"] = offset
 
-            updates = requests.get(
-                f"{BASE}/getUpdates", params=p, timeout=35
-            ).json().get("result", [])
+            params = {
+                "timeout": 30
+            }
 
-            for u in updates:
-                offset = u["update_id"] + 1
-                if "message" in u: handle(u["message"])
+            if offset is not None:
+                params["offset"] = offset
+
+            response = requests.get(
+                f"{BASE}/getUpdates",
+                params=params,
+                timeout=35
+            )
+
+            response.raise_for_status()
+
+            updates = response.json().get(
+                "result",
+                []
+            )
+
+            for update in updates:
+
+                offset = update["update_id"] + 1
+
+                if "message" in update:
+                    handle(update["message"])
+
         except Exception as e:
+
             print("Telegram error:", e)
+
             time.sleep(5)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+
+    print("🧠 PLOY Chest X-ray Telegram Monitor")
+
+    # Thread สำหรับตรวจ Epoch / Model
+    monitor_thread = threading.Thread(
+        target=monitor_training,
+        daemon=True
+    )
+
+    monitor_thread.start()
+
+    # Telegram command listener
+    telegram_bot()
+
 
 if __name__ == "__main__":
     main()
